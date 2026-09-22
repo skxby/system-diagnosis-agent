@@ -1,0 +1,30 @@
+# 作品 3 · 诊断 Agent —— 密钥与运行时产物绝不进仓
+#
+# ⚠️ 实测坑（2026-09-22）：.gitignore **不支持行尾注释**！
+#    写成 `traces/   # 轨迹文件` 时，git 会把整行（含注释文字）当成模式 → **一条都不生效**。
+#    我第一次就是这么写的，结果 checkpoints/traces/.vscode 全被 staged；
+#    `.env` 只是恰好被没写注释的 `*.env` 那条救了 —— 差一点就把 API key 提交上去。
+#    规矩：**注释单独占一行**；改完 .gitignore 一定用 `git status --short` 和
+#    `git check-ignore -v <路径>` 亲眼验证，别信"我写了规则"。
+
+# ── 密钥（最高优先级：一次误提交就得换 key）──────────────
+.env
+*.env
+!.env.example
+
+# ── Python ────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# ── 运行时产物（都能重新生成）──────────────────────────
+checkpoints*.sqlite
+traces/
+eval_agent_report_*.csv
+ci_report.json
+
+# ── 编辑器 / 系统 ─────────────────────────────────────
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

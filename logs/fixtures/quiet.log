@@ -1,0 +1,10 @@
+2026-09-22 10:00:00 INFO  [main] app service starting, version 3.4.1
+2026-09-22 10:00:01 INFO  [main] config loaded from /etc/app/app.conf
+2026-09-22 10:00:02 INFO  [db] connection pool initializing, size=10
+2026-09-22 10:00:03 INFO  [db] connection pool ready, connections=10
+2026-09-22 10:00:04 INFO  [main] http server listening on 0.0.0.0:8080
+2026-09-22 10:05:00 INFO  [http] GET /health 200 2ms
+2026-09-22 10:10:00 INFO  [http] GET /health 200 2ms
+2026-09-22 10:15:00 INFO  [disk] free space on / : 62.4%
+2026-09-22 10:20:00 INFO  [http] POST /api/v1/order 200 84ms
+2026-09-22 10:25:00 INFO  [http] GET /health 200 3ms

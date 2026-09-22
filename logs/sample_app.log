@@ -1,0 +1,30 @@
+2026-09-19 21:00:00 INFO  [main] app service starting, version 3.4.1
+2026-09-19 21:00:01 INFO  [main] config loaded from /etc/app/app.conf
+2026-09-19 21:00:02 INFO  [db] connection pool initializing, size=10
+2026-09-19 21:00:04 WARN  [db] connection attempt 1/3 timeout after 3000ms, host=10.20.31.7:5432
+2026-09-19 21:00:07 WARN  [db] connection attempt 2/3 timeout after 3000ms, host=10.20.31.7:5432
+2026-09-19 21:00:10 ERROR [db] connection attempt 3/3 failed: connection refused, host=10.20.31.7:5432
+2026-09-19 21:00:10 ERROR [main] failed to init database pool, entering degraded mode
+2026-09-19 21:00:11 INFO  [main] http server listening on 0.0.0.0:8080
+2026-09-19 21:00:12 WARN  [disk] free space on / low: 4.2%
+2026-09-19 21:01:30 INFO  [http] GET /health 200 3ms
+2026-09-19 21:02:15 WARN  [disk] free space on / low: 3.8%
+2026-09-19 21:03:02 ERROR [log] failed to append to /var/log/app/access.log: No space left on device
+2026-09-19 21:03:02 ERROR [log] writing to fallback buffer instead, buffered_lines=1024
+2026-09-19 21:05:41 WARN  [disk] free space on / low: 3.1%
+2026-09-19 21:07:19 ERROR [cache] failed to persist session cache: No space left on device
+2026-09-19 21:08:00 ERROR [http] POST /api/v1/order 500 1204ms
+2026-09-19 21:08:03 ERROR [http] POST /api/v1/order 500 987ms
+2026-09-19 21:09:12 WARN  [disk] free space on / low: 2.4%
+2026-09-19 21:10:00 ERROR [main] degraded mode: database unavailable for 10 minutes
+2026-09-19 21:11:22 ERROR [log] fallback buffer overflow, dropped 2048 lines
+2026-09-19 21:12:45 INFO  [ops] operator restarting service
+2026-09-19 21:12:46 INFO  [main] app service starting, version 3.4.1
+2026-09-19 21:12:47 WARN  [db] connection attempt 1/3 timeout after 3000ms, host=10.20.31.7:5432
+2026-09-19 21:12:50 ERROR [db] connection attempt 2/3 failed: connection refused
+2026-09-19 21:12:53 ERROR [main] failed to init database pool, entering degraded mode
+2026-09-19 21:13:01 ERROR [log] failed to append to /var/log/app/access.log: No space left on device
+2026-09-19 21:15:30 WARN  [disk] free space on / low: 1.9%
+2026-09-19 21:20:00 ERROR [http] POST /api/v1/order 500 2103ms
+2026-09-19 21:25:30 ERROR [main] service unhealthy, /health returns 503
+2026-09-19 21:30:00 INFO  [ops] paging on-call engineer
