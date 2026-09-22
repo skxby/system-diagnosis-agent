@@ -37,6 +37,7 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(HERE, ".env"))
 
 import collect as C
+import trend as trend_mod
 import budget as budget_mod
 import trace_util
 
@@ -62,6 +63,9 @@ def main():
     ap.add_argument("--yes", action="store_true", help="自动批准处置建议（CI/巡检用）")
     ap.add_argument("--max-calls", type=int, default=4, help="运行时预算：LLM 调用上限")
     ap.add_argument("--max-seconds", type=float, default=120.0, help="运行时预算：墙钟上限")
+    ap.add_argument("--history", default=None, help="历史文件路径（默认 snapshots/history.jsonl）")
+    ap.add_argument("--no-history", action="store_true", help="本次不写历史、也不做趋势分析")
+    ap.add_argument("--trend", action="store_true", help="打印趋势详情（含'为什么没给预测'）")
     args = ap.parse_args()
 
     # ── 1. 采集（或读已有快照）───────────────────────────────
@@ -81,12 +85,30 @@ def main():
             C.save(snap, args.save)
     findings = C.evaluate(snap)
     sev = max((SEVERITY_EXIT.get(f["severity"], 0) for f in findings), default=0)
+
+    # ── 趋势：把"当前值"升级成"可行动的时间预算" ──────────────────
+    # 每次体检都写进历史（巡检的自然产物），再基于同主机历史做预测。
+    history_path = args.history or trend_mod.DEFAULT_HISTORY
+    trend_findings, recs = [], []
+    if not args.no_history:
+        trend_mod.append_sample(snap, ["ok", "warning", "critical"][sev], path=history_path)
+        recs = trend_mod.load(history_path, host=snap.get("host"), last_n=200)
+        trend_findings = trend_mod.evaluate_trends(recs, snap)
+        if trend_findings:
+            findings = sorted(findings + trend_findings,
+                              key=lambda f: {"critical": 0, "warning": 1, "info": 2}
+                              .get(f["severity"], 9))
+            # ★ 预测也影响退出码：监控因此能**提前**报警，而不是等阈值被击穿
+            sev = max(sev, max(SEVERITY_EXIT.get(f["severity"], 0) for f in trend_findings))
+
     text = C.render(snap, findings)
 
     print("=" * 86)
     print(f"真机体检（{src}）｜主机 {snap.get('host')}｜{snap.get('collected_at')}")
     print("=" * 86)
     print(text)
+    if not args.no_history:
+        print(f"\n【趋势】{trend_mod.explain(recs) if (args.trend or trend_findings) else ''}".rstrip())
 
     # ── 2. 结构化结果（监视器/告警管道要的是这个，不是散文）────
     result = {
@@ -94,6 +116,9 @@ def main():
         "source": src, "collect_seconds": snap.get("collect_seconds"),
         "findings": findings, "worst_severity": ["ok", "warning", "critical"][sev],
         "exit_code": sev, "report": None, "approved": [], "note": "",
+        "trend": {"history_samples": len(recs),
+                  "signals": [f for f in trend_findings],
+                  "history_path": None if args.no_history else history_path},
     }
 
     if args.no_llm:

@@ -138,6 +138,8 @@ def l1_steps(py_agent, py_tool):
          ("kw", r"(\d+) 项通过，0 项失败", "{} 项通过（阈值边界/缺数据不误报/只读性/dump 解析）")),
         ("沙箱安全边界测试", [py_agent, "test_sandbox.py"],
          ("kw", r"(\d+) 项通过，0 项失败", "{} 项通过（穿越/敏感文件名/危险根）")),
+        ("趋势与预测测试", [py_agent, "test_trend.py"],
+         ("kw", r"(\d+) 项通过，0 项失败", "{} 项通过（拟合精度/不给预测/历史裁剪）")),
         ("评测 L1 离线自检", [py_agent, "eval_agent.py", "--offline"],
          ("kw", r"L1 结论：全部通过", "判据表自洽 + fixture 齐备")),
     ]
