@@ -51,7 +51,10 @@ ATTRIB_SYS = ("你是资深 SRE。下面给的是**程序采集到的事实**与
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--from", dest="from_file", default=None, help="分析已有快照 JSON")
+    ap.add_argument("--from", dest="from_file", default=None,
+                    help="分析已有快照：.json → 本地快照；其它 → 当作 collect_linux.sh 的文本 dump 解析")
+    ap.add_argument("--from-linux-dump", dest="linux_dump", default=None,
+                    help="显式指定 Linux dump 文件（板子/VM 上 sh collect_linux.sh 的输出）")
     ap.add_argument("--log-dir", action="append", default=None, help="顺带扫大文件的目录（可多次）")
     ap.add_argument("--save", default=None, help="把本次快照存成 JSON")
     ap.add_argument("--json", dest="json_out", default=None, help="把结果写成结构化 JSON（接监控）")
@@ -63,7 +66,12 @@ def main():
 
     # ── 1. 采集（或读已有快照）───────────────────────────────
     t0 = time.time()
-    if args.from_file:
+    if args.linux_dump or (args.from_file and not args.from_file.lower().endswith(".json")):
+        path = args.linux_dump or args.from_file
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            snap = C.parse_linux_dump(f.read())
+        src = f"Linux 采集 dump {path}"
+    elif args.from_file:
         snap = C.load(args.from_file)
         src = f"快照文件 {args.from_file}"
     else:

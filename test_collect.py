@@ -181,6 +181,44 @@ def main():
     check("渲染不含密钥特征串（体检不该读密钥文件）",
           not any(k in txt for k in ("sk-", "DEEPSEEK_API_KEY", "SECRET", "PASSWORD")))
 
+    # ── [6] Linux dump 解析（板子/VM 上 shell 采集 → 开发机解析）──────────
+    # 这条链的意义：目标机没有 Python/pip，但有 /proc 和 busybox sh；
+    # 脚本只搬事实，判断全在分析侧 —— 所以解析器必须能离线测。
+    print("\n[6] Linux dump 解析（板子采集 → 开发机分析）")
+    dump_path = os.path.join(here, "logs", "fixtures", "linux_dump_board.txt")
+    with open(dump_path, "r", encoding="utf-8") as f:
+        dump = f.read()
+    ds = C.parse_linux_dump(dump)
+    check("主机名/时间解析出来", ds["host"] == "rk3568-board" and ds["collected_at"].startswith("2026-09-24"))
+    check("核数解析（load 要跟核数比才有意义）", ds["environment"]["ncpu"] == 4)
+    check("磁盘逐挂载点解析（跳过 devtmpfs/tmpfs）",
+          {d["mount"] for d in ds["disks"]["items"]} == {"/", "/var", "/boot"},
+          [d["mount"] for d in ds["disks"]["items"]])
+    check("挂载点用量与时 inode 合并",
+          abs([d for d in ds["disks"]["items"] if d["mount"] == "/"][0]["used_pct"] - 97.0) < 0.1
+          and [d for d in ds["disks"]["items"] if d["mount"] == "/"][0]["inode_used_pct"] == 93.0)
+    check("内存可用率按 MemAvailable 算（不是 MemFree）",
+          abs(ds["memory"]["available_pct"] - 4.4) < 0.2, ds["memory"]["available_pct"])
+    check("swap 用量解析", ds["memory"]["swap_used_pct"] > 70)
+    check("oom_kill 计数解析", ds["kernel"]["oom_kill"]["count"] == 3)
+    check("TIME_WAIT 解析", ds["kernel"]["tcp_time_wait"]["count"] == 7213)
+    check("PSI memory 解析", abs(ds["kernel"]["psi"]["by_resource"]["memory"]["avg60"] - 28.44) < 0.01)
+    check("cgroup 限额解析", ds["kernel"]["cgroup_mem"]["used_pct"] > 95)
+    check("温度解析（毫摄氏度 → 摄氏度）", ds["thermal"]["max_celsius"] == 82.3, ds["thermal"]["max_celsius"])
+    check("CPU 频率解析（kHz → MHz）", ds["cpu_freq_mhz"]["max"] == 1800.0)
+    check("大文件解析", ds["log_dirs"]["/var/log"]["top"][0]["mb"] > 2000)
+    fired = {f["rule"] for f in C.evaluate(ds)}
+    expect = {"DISK_USED_HIGH", "DISK_INODE_HIGH", "MEM_AVAILABLE_LOW", "SWAP_PRESSURE",
+              "LOAD_HIGH", "OOM_KILL_EVENTS", "FD_USAGE_HIGH", "TCP_TIME_WAIT_HIGH",
+              "PSI_MEM_PRESSURE", "CGROUP_MEM_NEAR_LIMIT", "THERMAL_HIGH", "BIG_FILE"}
+    check("规则在真实 dump 上全部触发（12 条齐活）", expect <= fired, sorted(expect - fired))
+    check("渲染能吃 Linux dump 的快照", "rk3568-board" in C.render(ds, C.evaluate(ds)))
+    # 空/残缺 dump 不许崩、也不许编造
+    empty = C.parse_linux_dump("###HOST\nlinux\n###END")
+    check("残缺 dump 解析不崩且全标不可用",
+          empty["disks"]["available"] is False and empty["memory"]["available"] is False
+          and C.evaluate(empty) == [])
+
     print("\n" + "=" * 74)
     print(f"结果：{len(PASS)} 项通过，{len(FAIL)} 项失败（耗时 {time.perf_counter() - t0:.2f}s）")
     if FAIL:

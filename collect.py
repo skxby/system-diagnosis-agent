@@ -234,8 +234,17 @@ def collect_kernel(proc_root="/proc"):
     if nr and fmax:
         try:
             allocated = int(nr.split()[0])
-            out["fds"] = {"available": True, "allocated": allocated, "max": fmax,
-                          "used_pct": round(allocated / fmax * 100, 1)}
+            # ⚠️ 内核默认的 file-max 是 9223372036854775807（实际上是"无限"）。
+            # 拿它当分母算出的比例永远是 0%，看着"很健康" —— 这是**误导性指标**，
+            # 比没有指标更糟（Day 38 那条"全绿不等于质量高"的同类）。
+            # 所以分母不合理时宁可**不出这个指标**，让人去看 per-process 的 ulimit。
+            if fmax > 2 ** 40:
+                out["fds"] = {"available": True, "allocated": allocated, "max": fmax,
+                              "used_pct": None,
+                              "note": "file-max 是内核默认的'无限'，该比值无意义（要看 ulimit -n）"}
+            else:
+                out["fds"] = {"available": True, "allocated": allocated, "max": fmax,
+                              "used_pct": round(allocated / fmax * 100, 1)}
         except (ValueError, IndexError):
             out["fds"] = {"available": False}
 
@@ -330,6 +339,218 @@ def top_files_by_size(root, top_n=5, min_mb=1, max_entries=WALK_MAX_ENTRIES,
     found.sort(key=lambda x: -x["mb"])
     return {"available": True, "scanned": scanned, "truncated": scanned > max_entries,
             "top": found[:top_n]}
+
+
+# ══════════════════════════════════════════════════════════════════
+# 解析目标机 dump（collect_linux.sh 的输出）→ 与 snapshot() 同构的快照
+# ══════════════════════════════════════════════════════════════════
+# 为什么要"脚本采集 + 分析侧解析"：板子上没有 Python/pip，但有 /proc 和 busybox sh。
+# 让脚本只负责**把事实原样搬回来**，判断全在分析侧 —— 这样规则引擎可复现、可回归、可离线测。
+_SKIP_FS = {"proc", "sysfs", "tmpfs", "devtmpfs", "cgroup", "cgroup2", "overlay", "devpts",
+            "securityfs", "debugfs", "tracefs", "pstore", "bpf", "autofs", "mqueue",
+            "hugetlbfs", "configfs", "fusectl", "binfmt_misc", "nsfs", "squashfs"}
+# df -P 不给文件系统类型，只能按**挂载点前缀**过滤伪挂载。
+# 实测踩到：WSL 里 df 会列出 /run/credentials/*.service、/mnt/wslg/* 这些"0.0 GB 的磁盘"，
+# 混进报告就是噪声 —— 运维报告里塞噪声 = 让人开始忽略报告。
+_SKIP_MOUNT_PREFIXES = ("/dev", "/sys", "/proc", "/run", "/snap", "/mnt/wsl",
+                        "/var/lib/docker", "/var/snap", "/var/lib/kubelet")
+
+
+def _is_pseudo_mount(mount):
+    return mount.startswith(_SKIP_MOUNT_PREFIXES)
+
+
+def _split_sections(text):
+    out, cur = {}, None
+    for line in (text or "").splitlines():
+        if line.startswith("###"):
+            cur = line[3:].strip()
+            out.setdefault(cur, [])
+        elif cur:
+            out[cur].append(line)
+    return {k: "\n".join(v) for k, v in out.items()}
+
+
+def parse_linux_dump(text):
+    """把 `collect_linux.sh` 的文本 dump 解析成快照结构（字段名与 snapshot() 一致）。
+
+    缺段/缺字段一律 → `available: false`：**解析不出来就等于没采到**，
+    绝不用默认值假装正常（同一条纪律：缺数据不许报假健康）。
+    """
+    sec = _split_sections(text)
+    snap = {"collected_at": (sec.get("DATE") or "").strip().splitlines()[0]
+            if sec.get("DATE") else time.strftime("%Y-%m-%d %H:%M:%S"),
+            "source": "linux-dump", "collect_seconds": None,
+            "host": (sec.get("HOST", "").strip().splitlines() or ["?"])[-1] or "?"}
+
+    # 环境
+    ncpu = None
+    m = re.search(r"ncpu=(\d+)", sec.get("LOADAVG", ""))
+    if m:
+        ncpu = int(m.group(1))
+    uname = (sec.get("HOST", "").splitlines() or [""])[0]
+    snap["environment"] = {"available": True, "platform": uname or "unknown",
+                           "kernel": uname.split()[2] if len(uname.split()) > 2 else "?",
+                           "ncpu": ncpu or 1, "python": None,
+                           "in_container": (sec.get("CONTAINER", "").strip().startswith("yes"))}
+
+    # 运行时长
+    up = (sec.get("UPTIME") or "").split()
+    snap["uptime"] = {"available": bool(up),
+                      "seconds": float(up[0]) if up and _isnum(up[0]) else None}
+
+    # 磁盘（df -P 与 df -Pi 两张表按挂载点合并）
+    disks, dfi = {}, {}
+    for line in (sec.get("DF") or "").splitlines()[1:]:
+        p = line.split()
+        if len(p) >= 6 and p[5].startswith("/") and p[0].split("/")[0].strip("[]") not in _SKIP_FS \
+                and not _is_pseudo_mount(p[5]):
+            kb = int(p[1]) if p[1].isdigit() else 0
+            pct = float(p[4].rstrip("%")) if p[4].rstrip("%").replace(".", "").isdigit() else None
+            disks[p[5]] = {"mount": p[5], "available": True,
+                           "total_gb": round(kb * 1024 / 2 ** 30, 1),
+                           "used_gb": round((kb * 1024) * (pct or 0) / 100 / 2 ** 30, 1),
+                           "free_gb": round(int(p[3]) * 1024 / 2 ** 30, 1) if p[3].isdigit() else None,
+                           "used_pct": pct}
+    for line in (sec.get("DFI") or "").splitlines()[1:]:
+        p = line.split()
+        if len(p) >= 6 and p[5].startswith("/"):
+            ipct = p[4].rstrip("%")
+            if ipct.replace(".", "").isdigit():
+                dfi[p[5]] = float(ipct)
+    for mount, item in disks.items():
+        if mount in dfi:
+            item["inode_used_pct"] = dfi[mount]
+    # ── 过滤"不是真磁盘"的项（实测踩到：WSL 会把文件/绑定挂载也列进 df）──
+    # 三条启发式：① 深度 >3 的挂载基本不是数据盘；② 像文件的挂载点（/init、/etc/hosts.x）
+    # ③ 与某个更浅的挂载点 (total, used_pct) 完全一致 → 同一块盘的重复绑定，只留最短路径。
+    # 为什么较真：**报告里的噪声会训练人忽略报告**（和"脆弱的测试训练你忽视红色"是同一件事）。
+    kept = []
+    for mount in sorted(disks, key=lambda m: m.count("/")):
+        it = disks[mount]
+        if mount.count("/") > 3 or _is_pseudo_mount(mount):
+            continue
+        if "." in os.path.basename(mount.rstrip("/")) or mount in ("/init", "/etc/hosts",
+                                                                   "/etc/hostname", "/etc/resolv.conf"):
+            continue
+        if any(k["total_gb"] == it["total_gb"] and k["used_pct"] == it["used_pct"] for k in kept):
+            continue
+        kept.append(it)
+    items = kept
+    snap["disks"] = {"available": bool(items), "items": items or [],
+                     "reason": None if items else "dump 里没有可解析的 df 行"}
+
+    # 内存
+    kv = {}
+    for line in (sec.get("MEMINFO") or "").splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            kv[k.strip()] = v.strip()
+    total, avail = _kb(kv, "MemTotal"), _kb(kv, "MemAvailable")
+    if total:
+        mem = {"available": True, "source": "linux-dump/meminfo",
+               "total_mb": round(total / 1024, 1),
+               "available_mb": round((avail or 0) / 1024, 1),
+               "available_pct": round((avail or 0) / total * 100, 1)}
+        if (st := _kb(kv, "SwapTotal")):
+            mem["swap_total_mb"] = round(st / 1024, 1)
+            mem["swap_used_pct"] = round((st - (_kb(kv, "SwapFree") or 0)) / st * 100, 1)
+        snap["memory"] = mem
+    else:
+        snap["memory"] = {"available": False, "reason": "dump 里没有 meminfo"}
+
+    # 负载
+    la = (sec.get("LOADAVG") or "").split()
+    if len(la) >= 3 and _isnum(la[0]):
+        n = ncpu or 1
+        snap["load"] = {"available": True, "source": "linux-dump/loadavg", "ncpu": n,
+                        "load1": float(la[0]), "load5": float(la[1]), "load15": float(la[2]),
+                        "load1_per_cpu": round(float(la[0]) / n, 2)}
+    else:
+        snap["load"] = {"available": False, "reason": "dump 里没有 loadavg", "ncpu": ncpu or 1}
+
+    # 内核侧
+    k = {}
+    m = re.search(r"oom_kill\s+(\d+)", sec.get("VMSTAT", ""))
+    k["oom_kill"] = {"available": bool(m), "count": int(m.group(1)) if m else None}
+    fn = [x for x in (sec.get("FILENR") or "").splitlines() if x.strip()]
+    if fn:
+        cols = fn[0].split()
+        fmax = int(fn[1]) if len(fn) > 1 and fn[1].strip().isdigit() else \
+            (int(cols[2]) if len(cols) > 2 and cols[2].isdigit() else None)
+        if cols and cols[0].isdigit() and fmax:
+            if fmax > 2 ** 40:            # 内核默认"无限"：比值无意义，别报 0% 假装健康
+                k["fds"] = {"available": True, "allocated": int(cols[0]), "max": fmax,
+                            "used_pct": None,
+                            "note": "file-max 是内核默认的'无限'，该比值无意义（要看 ulimit -n）"}
+            else:
+                k["fds"] = {"available": True, "allocated": int(cols[0]), "max": fmax,
+                            "used_pct": round(int(cols[0]) / fmax * 100, 1)}
+    tw = re.search(r"time_wait=(\d+)", sec.get("TCP", ""))
+    if tw:
+        k["tcp_time_wait"] = {"available": True, "count": int(tw.group(1))}
+    psi = {}
+    cur_res = None
+    for line in (sec.get("PSI") or "").splitlines():
+        if line.startswith("-- "):
+            cur_res = line[3:].strip()
+            continue
+        m = re.search(r"some avg10=([\d.]+) avg60=([\d.]+)", line)
+        if m and cur_res:
+            psi[cur_res] = {"avg10": float(m.group(1)), "avg60": float(m.group(2))}
+    if psi:
+        k["psi"] = {"available": True, "by_resource": psi}
+    cg = [x.strip() for x in (sec.get("CGROUP") or "").splitlines() if x.strip()]
+    nums = [int(x) for x in cg if x.isdigit()]
+    if len(nums) >= 2:
+        limit, cur = nums[0], nums[-1]          # v2 先出现；v1 两个数字在后
+        if 0 < limit < 2 ** 60:
+            k["cgroup_mem"] = {"available": True, "limit_mb": round(limit / 2 ** 20, 1),
+                               "current_mb": round(cur / 2 ** 20, 1),
+                               "used_pct": round(cur / limit * 100, 1)}
+    snap["kernel"] = k
+
+    # 温度 / 频率
+    zones = []
+    for line in (sec.get("THERMAL") or "").splitlines():
+        m = re.match(r"(\S+)\s+type=(\S*)\s+temp=(\d+)", line.strip())
+        if m:
+            raw = int(m.group(3))
+            c = raw / 1000.0 if raw > 1000 else float(raw)
+            if -50 < c < 200:
+                zones.append({"zone": m.group(1), "type": m.group(2) or "?", "celsius": round(c, 1)})
+    snap["thermal"] = {"available": bool(zones), "zones": zones,
+                       "max_celsius": max((z["celsius"] for z in zones), default=None)}
+    cf = [x.strip() for x in (sec.get("CPUFREQ") or "").splitlines() if x.strip().isdigit()]
+    if cf:
+        snap["cpu_freq_mhz"] = {"current": round(int(cf[0]) / 1000, 1),
+                                "max": round(int(cf[-1]) / 1000, 1) if len(cf) > 1 else None}
+
+    # 大文件
+    log_dirs, cur_dir, rows = {}, None, []
+    for line in (sec.get("BIGFILES") or "").splitlines():
+        if line.startswith("-- "):
+            if cur_dir:
+                log_dirs[cur_dir] = {"available": True, "top": rows}
+            cur_dir, rows = line[3:].strip(), []
+        else:
+            p = line.split(None, 1)
+            if len(p) == 2 and p[0].isdigit():
+                rows.append({"path": p[1].strip(), "mb": round(int(p[0]) / 2 ** 20, 1)})
+    if cur_dir:
+        log_dirs[cur_dir] = {"available": True, "top": rows}
+    if log_dirs:
+        snap["log_dirs"] = log_dirs
+    snap["top_raw"] = (sec.get("TOP") or "").strip()[:2000] or None
+    return snap
+
+
+def _isnum(x):
+    try:
+        float(x)
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -445,7 +666,7 @@ def evaluate(snap, thresholds=None):
             f"vmstat 记录 oom_kill={oom['count']} 次 —— **这是程序被杀的真正原因**",
             "查 dmesg 里被杀进程名与内存水位；给关键进程设内存上限与重启策略")
     fd = k.get("fds", {})
-    if fd.get("available"):
+    if fd.get("available") and fd.get("used_pct") is not None:      # None = 分母无意义，见采集侧注释
         p = fd.get("used_pct")
         if p is not None and p >= th["fd_crit_pct"]:
             add("FD_USAGE_HIGH", "critical", "file descriptors",
@@ -531,6 +752,10 @@ def render(snap, findings):
             L.append(f"{label}：{json.dumps({k: v for k, v in s.items() if k != 'available'}, ensure_ascii=False)}")
         else:
             L.append(f"{label}：**未采集到**（{s.get('reason', '平台不支持')}）")
+    if snap.get("cpu_freq_mhz"):
+        f = snap["cpu_freq_mhz"]
+        L.append(f"CPU 频率：当前 {f.get('current')} MHz / 上限 {f.get('max')} MHz"
+                 f"（降频会表现为「变慢」，值得跟温度一起看）")
     k = snap.get("kernel", {})
     for key in ("oom_kill", "fds", "tcp_time_wait", "psi", "cgroup_mem"):
         s = k.get(key)

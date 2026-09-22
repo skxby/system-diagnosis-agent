@@ -701,6 +701,9 @@ def main():
     ap.add_argument("--max-tools", type=int, default=12, help="运行时预算：总工具调用次数上限")
     ap.add_argument("--max-seconds", type=float, default=240.0,
                     help="运行时预算：墙钟总时长上限（同时作为单次调用的超时上限）")
+    ap.add_argument("--root", default=None,
+                    help="沙箱根（工具只能读这个目录下的文件）。默认 logs/；也可用环境变量 DIAG_ROOT。"
+                         "**配到含密钥的目录会被警告**，配成整盘/家目录会被拒绝")
     args = ap.parse_args()
 
     if args.graph:
@@ -729,6 +732,18 @@ def main():
         return
 
     _LOG_FILE = CLEAN_LOG if args.clean else LOG_FILE
+    # 沙箱根：可配置（Day 32 遗留）。**先设置再干活** —— 工具层所有读写都过这一关。
+    if args.root:
+        try:
+            root, warns = d32.set_root(args.root)
+            print(f"  沙箱根 = {root}")
+            for w in warns:
+                print(f"  ⚠️  {w}")
+        except ValueError as e:
+            print(f"错误：{e}")
+            return
+    print(f"  工具可读范围：{d32.root_info()['allowed_root']}"
+          f"（敏感文件名一律拒绝，如 .env / *.pem / *.sqlite）")
     _CLIENT = make_client()
     # 普通运行：每次新开一个 thread（否则上一次的 report/decision 会被当成"已有状态"继承进来）
     # stage 1/2：必须共用同一个 thread，那是"同一个案子的两次到场"

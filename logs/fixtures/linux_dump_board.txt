@@ -1,0 +1,75 @@
+###HOST
+Linux rk3568-board 5.10.110-rockchip-g0e2c3f1 #1 SMP Fri Sep 12 10:22:31 CST 2026 aarch64 GNU/Linux
+rk3568-board
+###DATE
+2026-09-24 09:41:07
+###UPTIME
+187243.55 1433210.20
+###LOADAVG
+6.24 5.88 4.71 3/412 88231
+ncpu=4
+###MEMINFO
+MemTotal:        3893216 kB
+MemFree:           41288 kB
+MemAvailable:     171464 kB
+Buffers:           12044 kB
+Cached:           391208 kB
+SwapTotal:       1048572 kB
+SwapFree:         230684 kB
+Dirty:              9132 kB
+###DF
+Filesystem     1024-blocks     Used Available Capacity Mounted on
+/dev/root         30575104 29352112    918992      97% /
+devtmpfs           1946608        0   1946608       0% /dev
+tmpfs              1946608      848   1945760       1% /dev/shm
+/dev/mmcblk0p5    10485760  9542041    943719      92% /var
+/dev/mmcblk0p6      524288      1024    523264       1% /boot
+###DFI
+Filesystem      Inodes   IUsed   IFree IUse% Mounted on
+/dev/root      1905632 1772240  133392   93% /
+devtmpfs        486652     812  485840    1% /dev
+tmpfs           486652       9  486643    1% /dev/shm
+/dev/mmcblk0p5  655360  574013   81347   88% /var
+###VMSTAT
+pgfault 15572344
+pgmajfault 41288
+oom_kill 3
+###FILENR
+88012	0	100000
+100000
+###TCP
+total=8421
+time_wait=7213
+###PSI
+-- cpu
+some avg10=18.42 avg60=12.11 avg300=6.04 total=48211933
+full avg10=9.88 avg60=6.02 avg300=2.88 total=21033812
+-- memory
+some avg10=31.55 avg60=28.44 avg300=17.62 total=71218344
+full avg10=21.03 avg60=19.88 avg300=11.02 total=41022881
+-- io
+some avg10=7.12 avg60=5.33 avg300=3.10 total=12033812
+full avg10=3.02 avg60=2.11 avg300=1.02 total=6122112
+###CGROUP
+536870912
+528482304
+###THERMAL
+thermal_zone0 type=soc-thermal temp=82300
+thermal_zone1 type=gpu-thermal temp=79100
+thermal_zone2 type=bigcore0-thermal temp=76800
+###CPUFREQ
+408000
+1800000
+###CONTAINER
+no
+###TOP
+Mem: 3802M total, 3612M used, 190M free, 24M buffers
+  PID USER      PR  NI  VIRT  RES  SHR S %CPU %MEM     TIME+  COMMAND
+ 1188 root      20   0 1204m 812m 102m R 142.3 21.4  4122:11 app-service
+  902 root      20   0  612m 512m  88m S  62.1 13.5  2210:04 postgres
+ 1420 root      20   0  184m  98m  21m S  18.4  2.6   412:22 logger
+###BIGFILES
+-- /var/log
+2254857830 /var/log/app/access.log
+104857600 /var/log/app/error.log
+###END

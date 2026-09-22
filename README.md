@@ -40,9 +40,11 @@ confirm -. 一个都没批 .-> __end__     ← 人的决定真的能改变走向
 | `test_budget.py` | 预算离线测试 26 项（并发超卖 / 死锁回归 / 重试记账），0.2s 不花钱 |
 | `ci.py` | **本地 CI（分档门禁）**：L1 免费 / L2 花小钱；解释器按能力探测；报告落 `ci_report.json` |
 | `context.py` | **上下文工程**：预算装填 / 压缩 / 外部记忆（按事件隔离）/ 子 agent 隔离 |
-| `collect.py` | **真机取证 + 12 条确定性规则**（只读、跨平台降级、缺数据不误报）|
-| `day42_live.py` | **真机运维入口**：体检 → 规则 → 归因 → 人机确认；退出码分级、`--json` 可接监控 |
-| `test_collect.py` | 规则引擎离线测试 35 项（阈值边界 / 缺数据不误报 / 只读性），0.1s |
+| `collect.py` | **真机取证 + 12 条确定性规则**（只读、跨平台降级、缺数据不误报）+ Linux dump 解析 |
+| `collect_linux.sh` | **板子/VM 采集脚本**（POSIX sh + busybox，目标机不需要 Python）|
+| `day42_live.py` | **真机运维入口**：体检 → 规则 → 归因 → 人机确认；退出码分级、`--json`、`--from-linux-dump` |
+| `test_collect.py` | 规则引擎 + dump 解析离线测试 51 项，0.1s |
+| `test_sandbox.py` | **沙箱安全边界测试** 21 项（穿越 / 敏感文件名 / 危险根），0.1s |
 | `day41_context.py` | 上下文策略实验台（五策略 × 同一份真实规模日志，真实 token 计量）|
 | `make_biglog.py` | 生成**真实规模**日志 fixture（3672 行 / 286 KB / ≈121k token，确定性可复现）|
 | `.gitignore` + `.git/hooks/pre-commit` | 密钥与运行时产物不进仓；免费档挂在提交钩子上 |
@@ -268,6 +270,25 @@ fd 用量 / TIME_WAIT / **PSI 压力** / **cgroup 限额**（主机充足但容�
 
 **可用性**：退出码 `0=ok / 1=warning / 2=critical` + `--json` 结构化输出 → 直接当监控插件；
 模型只做**归因与排序**，prompt 里硬约束"不许引入规则未发现的严重项，猜测必须标注"。
+
+### 板子/VM：**shell 采集 + 开发机分析**（目标机不需要 Python）
+RK3568 这类目标机常常没有 Python/pip，但一定有 busybox sh 和 `/proc`：
+
+```bash
+# 目标机上（纯只读）
+sh collect_linux.sh > snap.txt        # 可选参数：要顺便找大文件的目录
+# 传回（板子常用 http 直传；见 Day 29 经验）
+# 开发机上
+& $py day42_live.py --from-linux-dump snap.txt --no-llm
+```
+
+**采集与判断解耦**：脚本只把事实原样搬回来，解析与规则全在分析侧（可复现、可回归、可离线测）。
+
+### 沙箱根可配置（`--root` / `DIAG_ROOT`）+ 三道安全边界
+读真实 `/var/log` 需要它。**根可配 = 攻击面可配**，所以同时加了：
+① **文件名黑名单**（根内也拒：`.env`/`*.pem`/`id_rsa*`/`*.sqlite`/`*secret*`）；
+② **危险根拒绝**（`E:\`、家目录 —— 等于没有沙箱）；③ 根里含密钥时**告警**（MCP server 写 stderr 审计）。
+`test_sandbox.py` 21 项钉住这些行为。
 
 **边界（刻意的）**：只给建议**不执行**任何处置；执行层（Ansible/SSH/运维平台）自己做二次校验与审计。
 

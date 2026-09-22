@@ -39,9 +39,19 @@ mcp = MCPServer(
     title="系统诊断工具",
     instructions=(
         "只读的系统诊断工具集：列出可读的日志文件、读日志尾部、按关键词搜索日志、"
-        "查看磁盘占用。不修改任何文件。所有路径都限制在数据目录内，越界会被拒绝。"
+        "按行号读日志区间、查看磁盘占用、真机体检、找大文件。不修改任何文件。"
+        "所有路径都限制在数据目录内，越界会被拒绝；敏感文件名（.env / 私钥 / 数据库文件）一律拒绝。"
     ),
 )
+
+# 审计：**启动时把生效的沙箱根写到 stderr**（stdout 是协议通道，日志必须走 stderr —— Day 33）。
+# 出了事要能回答"当时这个 server 到底能读哪儿"。
+_r = d32.root_info()
+print(f"[sysdiag] sandbox root = {_r['allowed_root']}（来自环境变量 DIAG_ROOT：{_r['from_env']}）",
+      file=sys.stderr)
+for _name in os.listdir(_r["allowed_root"]) if os.path.isdir(_r["allowed_root"]) else []:
+    if any(__import__("fnmatch").fnmatch(_name.lower(), p) for p in d32.SENSITIVE_PATTERNS):
+        print(f"[sysdiag] ⚠️ 沙箱根里存在敏感文件：{_name}（建议换专门的数据目录）", file=sys.stderr)
 
 
 # ══════════════════════════════════════════════════

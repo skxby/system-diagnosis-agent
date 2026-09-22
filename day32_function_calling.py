@@ -40,8 +40,57 @@ MODEL = "deepseek-flash"   # 2026-09-21 核验：规范名，旧名 deepseek-v4-
 #
 # 注意这是**专门的数据目录**，不是脚本所在目录：脚本目录里躺着 .env（含 API key）
 # 和脚本自身，把它当沙箱根，模型一次普通的 read_log(".env") 就能把密钥读进上下文，
-# 不需要任何穿越技巧。真机部署时这个值应该来自配置（比如数据在 /var/log/app）。
-ALLOWED_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+# 不需要任何穿越技巧。
+#
+# ── 2026-09-22（Day 43）：从"写死"改成**可配置** ──────────────────────
+# 优先级：显式 set_root() > 环境变量 DIAG_ROOT > 默认 logs/
+# 为什么要可配置：真机上日志在 /var/log/xxx，写死就只能读 fixture。
+# 可配置之后**安全边界必须跟着补**（见下面 SENSITIVE_PATTERNS / DANGEROUS_ROOTS）：
+# 根一可配，就可能被配到含密钥的目录 —— 光靠"路径没穿越"是不够的。
+DEFAULT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+ALLOWED_ROOT = os.environ.get("DIAG_ROOT") or DEFAULT_ROOT
+
+# 即使在沙箱根内，这些文件名也**一律拒绝**（纵深防御：路径合法 ≠ 该给你看）
+SENSITIVE_PATTERNS = (".env", ".env.*", "*.pem", "*.key", "*.pfx", "*.p12",
+                      "id_rsa*", "id_ed25519*", "*.kdbx", ".netrc", "credentials*",
+                      "*secret*", "*password*", "*.sqlite", "*.sqlite3")
+
+# 把整盘/根目录当沙箱根 = 沙箱形同虚设 —— 除非显式声明"我知道我在干什么"
+DANGEROUS_ROOTS = {os.path.sep, "C:\\", "D:\\", "E:\\", os.path.expanduser("~")}
+
+
+def set_root(path, allow_dangerous=False):
+    """切换沙箱根。返回 (root, warnings)。
+
+    ⚠️ 为什么要返回 warnings 而不是默默接受：**根可配 = 攻击面可配**。
+    如果新根里躺着 .env / 私钥，工具必须**当场告警**（"这个目录不适合当数据目录"），
+    而不是等模型把它读走。这是 Day 32 坑表 #16 的延伸：那次的教训是"沙箱根不能和密钥住一起"，
+    这次是"根变成可配置的之后，那条教训必须由代码守着"。
+    """
+    global ALLOWED_ROOT
+    warnings = []
+    full = os.path.realpath(path)
+    if not os.path.isdir(full):
+        raise ValueError(f"沙箱根不存在或不是目录：{path}")
+    if full in {os.path.realpath(d) for d in DANGEROUS_ROOTS} and not allow_dangerous:
+        raise ValueError(f"拒绝把 {full} 当沙箱根（等于没有沙箱）。确实需要请显式 allow_dangerous=True")
+    # 扫描直接子项里的敏感文件（只扫一层，避免在大目录上耗时）
+    try:
+        for name in os.listdir(full):
+            if any(fnmatch.fnmatch(name.lower(), p) for p in SENSITIVE_PATTERNS):
+                warnings.append(f"沙箱根里存在敏感文件：{name}（建议换一个专门的数据目录）")
+    except OSError:
+        pass
+    ALLOWED_ROOT = full
+    return full, warnings
+
+
+def root_info():
+    """当前沙箱根与它会拒绝什么 —— 可观测的一部分（出了事要能回答"当时是哪个根"）。"""
+    return {"allowed_root": os.path.realpath(ALLOWED_ROOT), "default_root": DEFAULT_ROOT,
+            "from_env": bool(os.environ.get("DIAG_ROOT")),
+            "sensitive_denied": list(SENSITIVE_PATTERNS),
+            "dangerous_roots": sorted(DANGEROUS_ROOTS)}
 
 
 # ══════════════════════════════════════════════════
@@ -139,6 +188,11 @@ def _safe_path(path):
     realpath 一步解决两件事：解析掉 .. 和符号链接（不解析的话，一个指向外部的
     软链接就能穿），并把大小写归一化成磁盘上的真实形式。
     再用 commonpath 做路径语义的父子判断。
+
+    ── 2026-09-22 补第二道闸门 ──────────────────────────────
+    路径**合法**不等于**该给你看**：沙箱根可配置之后，根里完全可能躺着 .env 或私钥。
+    所以再加一层**文件名黑名单**（纵深防御）。两道闸门独立生效：
+    "根内但名字敏感" 与 "名字普通但在根外" 都会被拒。
     """
     root = os.path.realpath(ALLOWED_ROOT)
     full = os.path.realpath(os.path.join(root, path))
@@ -150,6 +204,10 @@ def _safe_path(path):
         inside = False
     if not inside:
         raise ValueError(f"路径越界，拒绝访问：{path}")
+    name = os.path.basename(full).lower()
+    if any(fnmatch.fnmatch(name, pat) for pat in SENSITIVE_PATTERNS):
+        raise ValueError(f"文件名命中敏感清单，拒绝访问：{os.path.basename(full)}"
+                         f"（路径在沙箱内也照样拒绝 —— 纵深防御）")
     return full
 
 
