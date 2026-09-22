@@ -27,12 +27,18 @@
     python -c "import asyncio, server; print([t.name for t in asyncio.run(server.mcp.list_tools())])"
 """
 import os
+import sys                    # ← 启动审计要写 stderr；原来漏了这句，`import server` 直接 NameError（MCP server 死了 4 个提交没人发现）
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 import day32_function_calling as d32
 import collect as collect_mod                      # 真机取证（只读）
+import audit as audit_mod                          # 安全审计 + 工具级作用域
+
+# ★ MCP server 是**信任边界**：每个工具都要声明它需要的作用域，
+#   而且**每次调用都要进审计**（谁/何时/读了什么）。默认只授予 read。
+GATE = audit_mod.Gate()
 
 mcp = MCPServer(
     name="sysdiag",
@@ -49,6 +55,8 @@ mcp = MCPServer(
 _r = d32.root_info()
 print(f"[sysdiag] sandbox root = {_r['allowed_root']}（来自环境变量 DIAG_ROOT：{_r['from_env']}）",
       file=sys.stderr)
+print(f"[sysdiag] {GATE.policy.describe()}", file=sys.stderr)
+print(f"[sysdiag] 审计日志 = {GATE.log.path}", file=sys.stderr)
 for _name in os.listdir(_r["allowed_root"]) if os.path.isdir(_r["allowed_root"]) else []:
     if any(__import__("fnmatch").fnmatch(_name.lower(), p) for p in d32.SENSITIVE_PATTERNS):
         print(f"[sysdiag] ⚠️ 沙箱根里存在敏感文件：{_name}（建议换专门的数据目录）", file=sys.stderr)
@@ -57,8 +65,16 @@ for _name in os.listdir(_r["allowed_root"]) if os.path.isdir(_r["allowed_root"])
 # ══════════════════════════════════════════════════
 # 错误处理：统一把「预料之中的失败」转成 ToolError
 # ══════════════════════════════════════════════════
-def _safe_call(fn, *args, **kwargs):
-    """调底层工具，把该给模型看到的信息包成 ToolError。
+def _safe_call(tool, scope, fn, *args, target=None, **kwargs):
+    """**带审计与作用域的调用**：先判作用域 → 执行 → 无论成败都记审计 →
+    再把该给模型看到的信息包成 ToolError。
+
+    ⚠ 工具一律走这里，**不许直接调 d32 的函数**：只要有一处绕过，
+    审计日志就不再可信（"没记录"和"没发生"分不清）。
+
+    作用域不足时抛 PermissionError；这一条**已经被审计过了**
+    （拒绝记录里带 deny_reason），所以在这里转成 ToolError 给模型看就行 ——
+    拒绝也要让模型知道为什么，否则它只会反复重试。
 
     **这是本文件最容易写错的一处，因为 SDK 把错误分两类，处理方式天差地别**：
 
@@ -73,7 +89,12 @@ def _safe_call(fn, *args, **kwargs):
      模型拿到一句空消息、没法改参数重试。Inspector 里一眼看出来了。）
     """
     try:
-        return fn(*args, **kwargs)
+        return GATE.call(tool, lambda: fn(*args, **kwargs),
+                         args={"args": [audit_mod.redact(a) for a in args],
+                               "kwargs": audit_mod.redact(kwargs)},
+                         target=target)
+    except PermissionError as e:
+        raise ToolError(str(e)) from e          # 作用域不足（已审计）
     except ValueError as e:
         # 路径越界 / lines 非法 —— 参数错了，原样告知
         raise ToolError(str(e)) from e
@@ -98,7 +119,8 @@ def list_files(pattern: str = "*") -> str:
     排查问题的第一步：先看有哪些日志可读，再决定读哪个。
     没有这个工具，就只能猜文件名。
     """
-    return _safe_call(d32.list_files, pattern)
+    return _safe_call("list_files", "read", d32.list_files, pattern,
+                      target=pattern)
 
 
 # ══════════════════════════════════════════════════
@@ -111,7 +133,8 @@ def read_log(path: str, lines: int = 20) -> str:
     适合还没有明确关键词时，先看日志尾部概况。
     path 是相对数据目录的路径，例如 sample_app.log。
     """
-    return _safe_call(d32.read_log, path, lines)
+    return _safe_call("read_log", "read", d32.read_log, path, lines,
+                      target=path)
 
 
 # ══════════════════════════════════════════════════
@@ -126,7 +149,8 @@ def search_log(path: str, keyword: str, max_hits: int = 5) -> str:
     keyword是要搜索的关键词，如 ERROR、磁盘
     max_hits是最多返回几条，默认 5
     """
-    return _safe_call(d32.search_log, path, keyword, max_hits)
+    return _safe_call("search_log", "read", d32.search_log, path, keyword,
+                      max_hits, target=path)
 
 
 # ══════════════════════════════════════════════════
@@ -139,7 +163,8 @@ def read_log_range(path: str, start: int, end: int = 0) -> str:
     不知道怎么搜关键词时，先取一段看看 —— 取证是按需的，不要预加载整份日志。
     end 省略时返回 start 起的 50 行。
     """
-    return _safe_call(d32.read_log_range, path, start, end or None)
+    return _safe_call("read_log_range", "read", d32.read_log_range, path, start,
+                      end or None, target=path)
 
 
 @mcp.tool()
@@ -150,8 +175,11 @@ def system_snapshot() -> str:
     纯只读、不起子进程、不改系统状态。平台缺的维度会明确标注"未采集到"——
     看不到就说看不到，不会假装健康。返回体检文本 + 确定性规则发现。
     """
-    snap = collect_mod.snapshot()
-    return collect_mod.render(snap, collect_mod.evaluate(snap))
+    def _run():
+        snap = collect_mod.snapshot()
+        return collect_mod.render(snap, collect_mod.evaluate(snap))
+
+    return _safe_call("system_snapshot", "read", _run)
 
 
 @mcp.tool()
@@ -160,18 +188,23 @@ def top_files_by_size(top_n: int = 5, min_mb: int = 1) -> str:
 
     只允许扫数据目录（沙箱内），遍历有条目上限与深度上限，权限失败静默跳过。
     """
-    info = collect_mod.top_files_by_size(d32.ALLOWED_ROOT, top_n=int(top_n), min_mb=int(min_mb))
-    if not info["top"]:
-        return f"数据目录下没有超过 {min_mb} MB 的文件（已扫描 {info['scanned']} 个文件）"
-    lines = [f"{f['mb']:>8.1f} MB  {f['path']}" for f in info["top"]]
-    return f"数据目录里最大的 {len(lines)} 个文件：\n" + "\n".join(lines)
+    def _run():
+        info = collect_mod.top_files_by_size(d32.ALLOWED_ROOT, top_n=int(top_n),
+                                            min_mb=int(min_mb))
+        if not info["top"]:
+            return (f"数据目录下没有超过 {min_mb} MB 的文件"
+                    f"（已扫描 {info['scanned']} 个文件）")
+        lines = [f"{f['mb']:>8.1f} MB  {f['path']}" for f in info["top"]]
+        return f"数据目录里最大的 {len(lines)} 个文件：\n" + "\n".join(lines)
+
+    return _safe_call("top_files_by_size", "read", _run, target=d32.ALLOWED_ROOT)
 
 
 @mcp.tool()
 def check_disk() -> str:
     """查看数据目录所在磁盘的占用情况。
     """
-    return _safe_call(d32.check_disk)
+    return _safe_call("check_disk", "read", d32.check_disk)
 
 
 # ══════════════════════════════════════════════════
@@ -186,7 +219,8 @@ def readable_logs() -> str:
       资源 = 客户端主动读（像读文件，模型不参与决策）
     这个区别面试常问。
     """
-    return d32.list_files("*.log")
+    return _safe_call("readable_logs", "read", d32.list_files, "*.log",
+                      target="*.log")
 
 
 if __name__ == "__main__":

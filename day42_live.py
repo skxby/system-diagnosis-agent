@@ -41,6 +41,7 @@ import trend as trend_mod
 import cost as cost_mod
 import converge as conv_mod
 import feedback as fb_mod
+import audit as audit_mod
 import budget as budget_mod
 import trace_util
 
@@ -122,6 +123,11 @@ def main():
     ap.add_argument("--fp-wide", action="store_true", help="允许 prefix/rule 宽匹配（要更多证据）")
     ap.add_argument("--fp-hours", type=int, default=168,
                     help="抑制有效期小时数（默认 7 天；**不允许永久抑制**）")
+    # ── 安全审计（谁在何时读了什么；MCP server 那边写的是同一份日志）──
+    ap.add_argument("--audit", default=None,
+                    help="审计日志路径（默认 snapshots/audit.jsonl）")
+    ap.add_argument("--no-audit", action="store_true",
+                    help="本次不写审计（**默认不许关**；只在离线复现时用）")
     args = ap.parse_args()
 
     if args.mark_fp and not (args.fp_reason or "").strip():
@@ -189,6 +195,18 @@ def main():
         sup_state.record(suppressed, host=snap.get("host"))
     sup_stats, sup_notes = fb_mod.audit_suppressions(sup_rules, sup_state)
     text = C.render(snap, kept)
+
+    # ── 1.45 安全审计：把"这次巡检读了一遍机器"记进审计日志 ──────────
+    # 巡检本身也是一次**读取访问**，读的是 /proc、/sys 和日志目录 ——
+    # 出了事要能回答"谁在什么时候读了什么"，所以它和 MCP 工具调用共用一份日志。
+    audit_log = audit_mod.AuditLog(args.audit or audit_mod.DEFAULT_AUDIT,
+                                   enabled=not args.no_audit)
+    audit_rec = audit_log.record(
+        "live_diagnose", args={"source": src, "log_dirs": args.log_dir or []},
+        scope="read", target=(args.linux_dump or args.from_file or "本机实时采集"),
+        result_summary=f"发现 {len(kept)} 条（抑制 {len(suppressed)} 条）",
+        duration_ms=(time.time() - t0) * 1000,
+        extra={"host": snap.get("host"), "worst": ["ok", "warning", "critical"][sev]})
 
     # ── 1.5 告警收敛：把"一次故障 N 条告警"收敛成"N 个事件 + 根因/连带" ──────
     # 企业调研里排第一的痛点不是"没有告警"，是"一次故障几十条告警，真信号被埋掉"。
@@ -299,6 +317,10 @@ def main():
                  "input_mode": args.llm_input, "input_chars": len(prompt_text),
                  "attempts": attempts, "wasted_tokens": wasted,
                  "ledger": ledger.summary(args.price_in, args.price_out)},
+        "audit": {"seq": audit_rec.get("seq"),
+                  "path": None if args.no_audit else audit_log.path,
+                  "principal": audit_mod.IDENTITY,
+                  "scopes": list(audit_mod.ScopePolicy.from_env().granted)},
         "trend": {"history_samples": len(recs),
                   "signals": [f for f in trend_findings],
                   "history_path": None if args.no_history else history_path},
@@ -343,6 +365,9 @@ def main():
                   f"指纹 {fp} 未变）→ **0 次模型调用**")
         print(report)
         print("\n" + cost_mod.render_cost(result["cost"]["ledger"]))
+        if not args.no_audit:
+            print(f"审计：seq #{audit_rec.get('seq')} 已记入 {audit_log.path}"
+                  f"（主体 {audit_mod.IDENTITY}）")
 
         # ── 5. 人机确认：处置动作要人批（本工具只给建议，不执行）──────
         # ★ 动作**按事件去重**：一次故障一个动作，而不是 N 条告警 N 个动作 ——

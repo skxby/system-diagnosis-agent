@@ -170,6 +170,20 @@ def l1_steps(py_agent, py_tool):
           "{} 项通过（不丢发现/严重度天花板/过期/过宽拦截/撤销/阈值建议）")),
         ("抑制规则自检", [py_agent, "feedback.py", "--check"],
          ("kw", r"抑制规则自检通过", "全部有理由、有有效期、范围合法（不许永久抑制）")),
+        ("安全审计测试", [py_agent, "test_audit.py"],
+         ("kw", r"(\d+) 项通过，0 项失败",
+          "{} 项通过（fail-closed/不记内容不记密钥/哈希链查篡改/轮转有界）")),
+        ("审计哈希链自检", [py_agent, "audit.py", "--verify"],
+         ("kw", r"哈希链校验通过", "记录未被改动（改内容/删除/换序都会断链）")),
+        # ★ 补上门禁的盲区：原来**没有任何一步 import server.py**，
+        #   所以"用了 sys 却没 import sys"这种错能活 4 个提交（MCP server 一直是死的）。
+        ("MCP server 能导入且工具齐全",
+         [py_agent, "-c",
+          "import asyncio, server; "
+          "print('TOOLS=' + ','.join(sorted(t.name for t in "
+          "asyncio.run(server.mcp.list_tools()))))"],
+         ("kw", r"TOOLS=.*read_log.*system_snapshot",
+          "7 个工具都注册上了（import 期就崩的错再也藏不住）")),
         ("评测 L1 离线自检", [py_agent, "eval_agent.py", "--offline"],
          ("kw", r"L1 结论：全部通过", "判据表自洽 + fixture 齐备")),
     ]
