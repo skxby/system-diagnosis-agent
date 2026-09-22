@@ -64,25 +64,33 @@ def find_python(module, env_var, candidates):
     return None
 
 
-def agent_python():
-    """编排层（langgraph / mcp / openai）—— 项目向上两级就是 .venv-agent"""
+def _venv_candidates():
+    """两个 venv 可能出现的位置（**按"能 import 到目标模块"来辨别身份**，不靠名字猜）。
+
+    为什么要列这么多：作品代码目前住在 `.venv\\作品3_诊断Agent`（venv 里面），
+    一旦按"交付化"搬到 `E:\\ai学习\\作品3_诊断Agent`，相对层级就变了 ——
+    这里提前把两种布局都列上，搬家时 CI 不会突然找不到解释器。
+    """
     up1 = os.path.dirname(PROJECT)
     up2 = os.path.dirname(up1)
-    return find_python("langgraph", "CI_PY_AGENT", [
-        os.path.join(up2, ".venv-agent", "Scripts", "python.exe"),
-        os.path.join(up2, "Scripts", "python.exe"),
-        os.path.join(up1, "Scripts", "python.exe"),
-    ])
+    out = []
+    for base in (up2, up1, os.path.join(up2, ".venv"), os.path.join(up2, ".venv-agent")):
+        for name in (".venv-agent", ".venv", ""):
+            p = os.path.join(base, name, "Scripts", "python.exe") if name else \
+                os.path.join(base, "Scripts", "python.exe")
+            if p not in out:
+                out.append(p)
+    return out
+
+
+def agent_python():
+    """编排层（langgraph / mcp / openai）"""
+    return find_python("langgraph", "CI_PY_AGENT", _venv_candidates())
 
 
 def tool_python():
-    """工具层 + 老测试（mcp / pytest / openai）—— 项目上一级就是 .venv"""
-    up1 = os.path.dirname(PROJECT)
-    up2 = os.path.dirname(up1)
-    return find_python("pytest", "CI_PY_OLD", [
-        os.path.join(up1, "Scripts", "python.exe"),
-        os.path.join(up2, ".venv", "Scripts", "python.exe"),
-    ])
+    """工具层 + 老测试（mcp / pytest / openai）"""
+    return find_python("pytest", "CI_PY_OLD", _venv_candidates())
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -116,6 +124,11 @@ def run_step(name, cmd, expect, timeout=900):
 
 def l1_steps(py_agent, py_tool):
     steps = [
+        # 最便宜、最致命的一条放最前面：密钥/产物**一次都不许进暂存区**
+        # （为什么要有它：我写 .gitignore 时踩过"行尾注释导致规则全失效"，
+        #   差点把 .env 提交上去 —— 规则靠不住的时候，就再加一道机器检查）
+        ("敏感文件不进暂存区", [py_agent, "ci.py", "--check-staged"],
+         ("rc", None, "暂存区无密钥/checkpoints/traces/报告")),
         ("语法编译全项目", [py_agent, "-m", "compileall", "-q", PROJECT], ("rc", None, "全部 .py 编译通过")),
         ("图能搭起来", [py_agent, "day36_graph_mcp.py", "--graph"],
          ("kw", r"graph TD", "mermaid 图已生成（import/注册/类型都过）")),
@@ -130,6 +143,44 @@ def l1_steps(py_agent, py_tool):
     return steps
 
 
+# 不许进仓的东西（正则）：密钥文件、checkpointer 落盘、轨迹、生成的报告
+FORBIDDEN = [
+    (r"(^|/)\.env$", "密钥文件 .env"),
+    (r"checkpoints.*\.sqlite$", "checkpointer 落盘文件"),
+    (r"(^|/)traces/", "轨迹/报告目录"),
+    (r"eval_agent_report_.*\.csv$", "评测报告 CSV"),
+    (r"ci_report\.json$", "CI 报告"),
+]
+
+
+def check_staged():
+    """暂存区里有没有不该进仓的东西 —— 给 pre-commit 用的硬检查。"""
+    try:
+        r = subprocess.run(["git", "diff", "--cached", "--name-only"],
+                           capture_output=True, timeout=60)
+    except Exception as e:
+        print(f"（不是 git 仓库或 git 不可用，跳过：{type(e).__name__}）")
+        return 0
+    if r.returncode != 0:
+        print("（git 不可用，跳过）")
+        return 0
+    staged = (r.stdout or b"").decode("utf-8", "replace").splitlines()
+    bad = []
+    for path in staged:
+        for pattern, what in FORBIDDEN:
+            if re.search(pattern, path.replace("\\", "/")):
+                bad.append(f"{path}（{what}）")
+    if bad:
+        print("❌ 暂存区出现不该进仓的文件：")
+        for b in bad:
+            print(f"   · {b}")
+        print("   处置：git reset HEAD <文件>，并确认 .gitignore 规则真的生效"
+              "（**注释要独占一行** —— 行尾注释会让整条规则失效）")
+        return 1
+    print(f"✓ 检查了 {len(staged)} 个暂存文件，无敏感文件")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tier", choices=["l1", "l2", "all"], default="l1")
@@ -138,7 +189,12 @@ def main():
     ap.add_argument("--verbose", action="store_true", help="失败时打出完整输出")
     ap.add_argument("--quiet", action="store_true", help="只在失败时输出（给 git hook 用）")
     ap.add_argument("--list", action="store_true", help="列出所有步骤")
+    ap.add_argument("--check-staged", action="store_true",
+                    help="只检查暂存区有没有不该进仓的文件（给 pre-commit 用）")
     args = ap.parse_args()
+
+    if args.check_staged:
+        return check_staged()
 
     py_agent, py_tool = agent_python(), tool_python()
 
