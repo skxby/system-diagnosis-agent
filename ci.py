@@ -134,6 +134,8 @@ def l1_steps(py_agent, py_tool):
          ("kw", r"graph TD", "mermaid 图已生成（import/注册/类型都过）")),
         ("预算离线测试", [py_agent, "test_budget.py"],
          ("kw", r"(\d+) 项通过，0 项失败", "{} 项通过（并发超卖/死锁回归/重试记账）")),
+        ("真机取证与规则测试", [py_agent, "test_collect.py"],
+         ("kw", r"(\d+) 项通过，0 项失败", "{} 项通过（阈值边界/缺数据不误报/只读性）")),
         ("评测 L1 离线自检", [py_agent, "eval_agent.py", "--offline"],
          ("kw", r"L1 结论：全部通过", "判据表自洽 + fixture 齐备")),
     ]

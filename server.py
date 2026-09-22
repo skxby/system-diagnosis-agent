@@ -32,6 +32,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 import day32_function_calling as d32
+import collect as collect_mod                      # 真机取证（只读）
 
 mcp = MCPServer(
     name="sysdiag",
@@ -129,6 +130,31 @@ def read_log_range(path: str, start: int, end: int = 0) -> str:
     end 省略时返回 start 起的 50 行。
     """
     return _safe_call(d32.read_log_range, path, start, end or None)
+
+
+@mcp.tool()
+def system_snapshot() -> str:
+    """对**运行本工具的主机**做一次只读体检：磁盘（含 inode）、内存、负载、温度、
+    OOM 计数、fd 用量、TIME_WAIT、PSI 压力、cgroup 限额。
+
+    纯只读、不起子进程、不改系统状态。平台缺的维度会明确标注"未采集到"——
+    看不到就说看不到，不会假装健康。返回体检文本 + 确定性规则发现。
+    """
+    snap = collect_mod.snapshot()
+    return collect_mod.render(snap, collect_mod.evaluate(snap))
+
+
+@mcp.tool()
+def top_files_by_size(top_n: int = 5, min_mb: int = 1) -> str:
+    """找出数据目录里最大的几个文件 —— 用来回答"是哪个文件把盘吃满的"。
+
+    只允许扫数据目录（沙箱内），遍历有条目上限与深度上限，权限失败静默跳过。
+    """
+    info = collect_mod.top_files_by_size(d32.ALLOWED_ROOT, top_n=int(top_n), min_mb=int(min_mb))
+    if not info["top"]:
+        return f"数据目录下没有超过 {min_mb} MB 的文件（已扫描 {info['scanned']} 个文件）"
+    lines = [f"{f['mb']:>8.1f} MB  {f['path']}" for f in info["top"]]
+    return f"数据目录里最大的 {len(lines)} 个文件：\n" + "\n".join(lines)
 
 
 @mcp.tool()

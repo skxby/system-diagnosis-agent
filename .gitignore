@@ -25,6 +25,7 @@ ci_report.json
 context_experiment.json
 memory/
 logs/big/
+snapshots/
 
 # ── 编辑器 / 系统 ─────────────────────────────────────
 .vscode/
