@@ -76,6 +76,34 @@ def search_log(path, keyword, max_hits=5):
     return body + more
 
 
+MAX_RANGE_LINES = 400          # 单次窗口上限：just-in-time 取证的"一次只取一小段"
+
+
+def read_log_range(path, start, end=None):
+    """按**行号区间**读日志 —— just-in-time 取证的入口。
+
+    为什么上下文工程需要它：真实日志 3000+ 行 / 十几万 token，**不可能整份塞进 prompt**。
+    `search_log` 只能按关键词捞（你不知道该搜什么的时候就抓瞎），
+    这个工具让你"先看一眼某一段，再决定下一步搜什么" —— 取证是按需的，不是预加载的。
+    区间有上限（MAX_RANGE_LINES），否则它自己就变成了"把整份日志塞进去"的后门。
+    """
+    full = _safe_path(path)
+    start = int(start)
+    end = int(end) if end is not None else start + 50
+    if start < 1 or end < start:
+        raise ValueError(f"行号区间非法：start={start}, end={end}")
+    if end - start + 1 > MAX_RANGE_LINES:
+        raise ValueError(f"单次窗口最多 {MAX_RANGE_LINES} 行，收到 {end - start + 1} 行"
+                         f"（要更多请分次读 —— 这条上限就是防'一次全读'）")
+    with open(full, "r", encoding="utf-8", errors="replace") as f:
+        all_lines = f.readlines()
+    tail = all_lines[start - 1:end]
+    if not tail:
+        return f"行号 {start}-{end} 超出文件范围（共 {len(all_lines)} 行）"
+    return (f"（文件共 {len(all_lines)} 行，本次返回 {start}-{start + len(tail) - 1}）\n"
+            + "".join(f"{i + start}: {t}" for i, t in enumerate(tail)))
+
+
 def check_disk(path=None):
     """查磁盘占用。用 shutil 走跨平台，真机运维应该用 df -h —— 这里是为了能在 Windows 上练"""
     target = path or ALLOWED_ROOT
@@ -178,16 +206,34 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "read_log_range",
+            "description": "按行号区间读日志（一次最多 400 行）。当你不确定该搜什么关键词、"
+                           "需要先看一眼某一段内容时使用；比 read_log 更精确，比 search_log 更适合探索。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "日志文件路径（相对数据目录）"},
+                    "start": {"type": "integer", "description": "起始行号（从 1 开始）"},
+                    "end": {"type": "integer", "description": "结束行号，默认 start+50"},
+                },
+                "required": ["path", "start"],
+            },
+        },
+    },
+    
+    {
+        "type": "function",
+        "function": {
             "name": "check_disk",
             "description": "查看磁盘空间占用情况。怀疑空间不足时使用。",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
-    
 ]
 
 TOOL_IMPL = {"list_files": list_files, "read_log": read_log,
-             "search_log": search_log, "check_disk": check_disk}
+             "search_log": search_log, "read_log_range": read_log_range,
+             "check_disk": check_disk}
 
 
 # ══════════════════════════════════════════════════

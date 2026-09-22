@@ -122,6 +122,16 @@ def search_log(path: str, keyword: str, max_hits: int = 5) -> str:
 # 工具 4 / 留给你补
 # ══════════════════════════════════════════════════
 @mcp.tool()
+def read_log_range(path: str, start: int, end: int = 0) -> str:
+    """按行号区间读日志，一次最多 400 行。
+
+    不知道怎么搜关键词时，先取一段看看 —— 取证是按需的，不要预加载整份日志。
+    end 省略时返回 start 起的 50 行。
+    """
+    return _safe_call(d32.read_log_range, path, start, end or None)
+
+
+@mcp.tool()
 def check_disk() -> str:
     """查看数据目录所在磁盘的占用情况。
     """

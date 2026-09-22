@@ -22,6 +22,9 @@ checkpoints*.sqlite
 traces/
 eval_agent_report_*.csv
 ci_report.json
+context_experiment.json
+memory/
+logs/big/
 
 # ── 编辑器 / 系统 ─────────────────────────────────────
 .vscode/
