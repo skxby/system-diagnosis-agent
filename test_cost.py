@@ -20,6 +20,9 @@ import time
 import shutil
 import tempfile
 
+# 直接跑这些脚本时也必须不依赖控制台代码页（Windows GBK 下 ✓/✗ 直接抛 UnicodeEncodeError）
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cost as C
 
@@ -133,6 +136,58 @@ def main():
         s2 = led.summary(price_in=1.0, price_out=2.0)
         check("给了单价才算钱", s2["cost_today"] is not None and s2["cost_today"] > 0, s2["cost_today"])
         check("缓存命中次数被统计", s["cached_runs_today"] == 1, s["cached_runs_today"])
+
+        # ── [5] 重试记账：成本工具不许漏记成本 ──────────────
+        # 实测踩到：推理型模型在 max_tokens 偏小时会把预算烧在推理上、正文为空 → 自动放大重试。
+        # 原来只取 usage_sink[-1]（成功那次），**废掉的那次 2000 token 被悄悄漏掉**。
+        print("\n[5] 真实用量汇总（含重试白烧）")
+        meter = [
+            {"label": "attrib", "attempt": 1, "max_tokens": 2000, "prompt_tokens": 1200,
+             "completion_tokens": 2000, "content_chars": 0, "reasoning_chars": 3900,
+             "finish_reason": "length"},
+            {"label": "attrib", "attempt": 2, "max_tokens": 4000, "prompt_tokens": 1200,
+             "completion_tokens": 900, "content_chars": 500, "reasoning_chars": 1200,
+             "finish_reason": "stop"},
+        ]
+        u = C.summarize_usage(meter)
+        check("尝试次数记对", u["attempts"] == 2, u["attempts"])
+        check("输入 token 按**每次尝试**累加（重试会重发提示词）",
+              u["prompt_tokens"] == 2400, u["prompt_tokens"])
+        check("输出 token 是全部尝试之和（不是只记最后一次）",
+              u["completion_tokens"] == 2900, u["completion_tokens"])
+        check("白烧的 token 被单独标出来", u["wasted_completion_tokens"] == 2000,
+              u["wasted_completion_tokens"])
+        check("白烧比例算得对", u["wasted_ratio"] == round(2000 / 2900, 3), u["wasted_ratio"])
+        check("每次尝试的明细都在（可解释为什么白烧）",
+              len(u["per_attempt"]) == 2 and u["per_attempt"][0]["finish_reason"] == "length")
+        check("只有一次尝试时白烧为 0",
+              C.summarize_usage([meter[1]])["wasted_completion_tokens"] == 0)
+        check("空 meter 不炸", C.summarize_usage([])["attempts"] == 0
+              and C.summarize_usage([])["total_tokens"] == 0)
+
+        # 账本要把白烧写进去，并能汇总（否则"控制成本"是假的）
+        lp2 = os.path.join(tmp, "cost2.jsonl")
+        led2 = C.CostLedger(path=lp2)
+        led2.record("h1", calls=1, tokens_in=2400, tokens_out=2900, attempts=2, wasted=2000)
+        led2.record("h1", calls=1, tokens_in=1000, tokens_out=500, attempts=1, wasted=0)
+        s3 = led2.summary()
+        check("汇总里能回答「有多少 token 是白烧的」",
+              s3["wasted_tokens_today"] == 2000, s3["wasted_tokens_today"])
+        check("汇总里能回答「几次运行触发了重试」",
+              s3["retry_runs_today"] == 1, s3["retry_runs_today"])
+        check("有白烧时账本渲染会提示（并给出可操作建议）",
+              "重试白烧" in C.render_cost(s3) and "max-output-tokens" in C.render_cost(s3),
+              C.render_cost(s3).splitlines()[1][:60])
+        check("没有白烧时不显示该警告",
+              "重试白烧" not in C.render_cost(C.CostLedger(path=os.path.join(tmp, "empty.jsonl"))
+                                              .summary()))
+        # 老记录（没有 attempts/wasted 字段）不能把汇总搞崩
+        with open(lp2, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": time.time(), "host": "h1", "calls": 1,
+                                 "tokens_in": 10, "tokens_out": 10}) + "\n")
+        check("兼容旧账本记录（缺字段按 0 算，不崩）",
+              led2.summary()["wasted_tokens_today"] == 2000,
+              led2.summary()["wasted_tokens_today"])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

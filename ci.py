@@ -97,10 +97,22 @@ def tool_python():
 # 每一步 = 一条命令 + 一条"怎么判定通过"的规则
 # ══════════════════════════════════════════════════════════════════
 def run_step(name, cmd, expect, timeout=900):
-    """跑一步，返回 (结果, 摘要, 耗时, 输出)"""
+    """跑一步，返回 (结果, 摘要, 耗时, 输出)
+
+    ★ 必须给子进程**固定 UTF-8**（实测踩到的真问题，而且是"门禁自身"的 bug）：
+    门禁的成败一度取决于"跑门禁的人有没有设 PYTHONIOENCODING" ——
+    手动跑（设了 utf-8）12 步全绿；`git commit` 触发钩子（没设）时 5 步失败。
+    根因：子进程按 Windows 控制台代码页（cp936）输出，而这里按 UTF-8 解码。
+    两种失败形态都出现过：编码不上的字符直接抛 `UnicodeEncodeError`（✓/✗ 不在 GBK 里），
+    编码得上的中文变成乱码 → 关键字匹配不上。
+    ➡️ **门禁的结果不允许取决于环境变量**，所以在这一处一次性钉死。
+    """
     t0 = time.perf_counter()
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
     try:
-        r = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout, env=env)
         out = (r.stdout or b"").decode("utf-8", "replace") + \
               (r.stderr or b"").decode("utf-8", "replace")
         code = r.returncode
@@ -129,6 +141,12 @@ def l1_steps(py_agent, py_tool):
         #   差点把 .env 提交上去 —— 规则靠不住的时候，就再加一道机器检查）
         ("敏感文件不进暂存区", [py_agent, "ci.py", "--check-staged"],
          ("rc", None, "暂存区无密钥/checkpoints/traces/报告")),
+        # ★ 门禁自身的自检（实测踩到）：门禁的成败一度取决于"跑门禁的人有没有设
+        #   PYTHONIOENCODING" —— 手动跑全绿、git 钩子触发时 5 步失败。
+        #   这里主动让子进程输出 ✓（GBK 编码不了它）：只有 run_step 真的给子进程
+        #   固定了 UTF-8，这一步才会通过。**门禁的结果不允许取决于环境变量。**
+        ("门禁不依赖控制台编码", [py_agent, "-c", "print('\u2713 编码自检 ok')"],
+         ("kw", r"✓ 编码自检 ok", "✓ 在 GBK 控制台下也能正确输出（子进程已强制 UTF-8）")),
         ("语法编译全项目", [py_agent, "-m", "compileall", "-q", PROJECT], ("rc", None, "全部 .py 编译通过")),
         ("图能搭起来", [py_agent, "day36_graph_mcp.py", "--graph"],
          ("kw", r"graph TD", "mermaid 图已生成（import/注册/类型都过）")),
@@ -142,6 +160,11 @@ def l1_steps(py_agent, py_tool):
          ("kw", r"(\d+) 项通过，0 项失败", "{} 项通过（拟合精度/不给预测/历史裁剪）")),
         ("成本控制测试", [py_agent, "test_cost.py"],
          ("kw", r"(\d+) 项通过，0 项失败", "{} 项通过（指纹/缓存/分级/账本限额）")),
+        ("告警收敛测试", [py_agent, "test_converge.py"],
+         ("kw", r"(\d+) 项通过，0 项失败",
+          "{} 项通过（完整性不变量/弱边不归组/不编根因/图自检/收敛真变短）")),
+        ("因果图自检", [py_agent, "converge.py", "--check-graph"],
+         ("kw", r"因果图自检通过", "无环、规则齐全、无反例矛盾（图错了归因就是错的）")),
         ("评测 L1 离线自检", [py_agent, "eval_agent.py", "--offline"],
          ("kw", r"L1 结论：全部通过", "判据表自洽 + fixture 齐备")),
     ]

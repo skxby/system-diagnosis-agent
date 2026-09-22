@@ -39,6 +39,7 @@ load_dotenv(os.path.join(HERE, ".env"))
 import collect as C
 import trend as trend_mod
 import cost as cost_mod
+import converge as conv_mod
 import budget as budget_mod
 import trace_util
 
@@ -49,6 +50,17 @@ ATTRIB_SYS = ("你是资深 SRE。下面给的是**程序采集到的事实**与
               "③ 明确写出证据不足、无法判断的地方。"
               "**硬约束**：不许引入规则发现里没有的严重项；若你有规则之外的猜测，必须标注为「推测」。"
               "引用发现时带上规则名（如 DISK_INODE_HIGH）。输出中文，300 字内。")
+
+# 收敛模式下喂模型的是「事件表」而不是平铺发现：**因果已经由程序里的因果图判定完了**。
+# 为什么不给模型自己判因果：不可复现、不可审计，而且它会**自信地编出因果**。
+ATTRIB_SYS_EVENTS = (
+    "你是资深 SRE。下面给的是**程序收敛后的事件表**：一个故障一个事件；"
+    "「根因」是程序用编码的因果图判定、机制上必然的；「候选根因」是未核验的；"
+    "「并列」是同一资源上互不解释、要分别处理的问题。"
+    "你的任务只有三件：① 按处置优先级排序这些事件；② 用运维语言说清「先做什么、为什么」；"
+    "③ 指出证据不足、需要人工确认的地方。"
+    "**硬约束**：不许改动程序给的因果（不许把并列写成连带，不许把候选根因写成确定根因）；"
+    "不许引入事件表里没有的严重项；推测必须标注「推测」。输出中文，300 字内。")
 
 
 def main():
@@ -63,10 +75,24 @@ def main():
     ap.add_argument("--no-llm", action="store_true", help="只出规则结论，不调用模型")
     ap.add_argument("--yes", action="store_true", help="自动批准处置建议（CI/巡检用）")
     ap.add_argument("--max-calls", type=int, default=4, help="运行时预算：LLM 调用上限")
+    # ★ 默认值不是拍脑袋定的：下面是同一提示词、同一机器、真实 API 的实测（各 3~4 次）
+    #     cap=2000 → 平均 6409 token/次，重试 3/4，平均 19.4s
+    #     cap=3000 → 平均 5443 token/次，重试 2/4，平均 15.8s   ← 本次实测期望成本最低
+    #     cap=4000 → 平均 6171 token/次，重试 1/3，失败那次白烧 4000（36s）
+    #   结论：**上限不是越大越好** —— 失败一次的浪费就是该上限本身；推理 token 是弹性的，
+    #   给得越大想得越久（实测同一提示词：cap 2000→推理 1118 字，cap 4000→推理 4131 字，
+    #   而正文反而从 583 字降到 445 字）。所以上限要按实测调，而账本会记下白烧的量。
+    ap.add_argument("--max-output-tokens", type=int, default=3000,
+                    help="归因输出上限（实测默认 3000 期望成本最低；太小会空正文并触发重试，"
+                         "重试要重发提示词+重想一遍，账本会记下白烧的 token）")
     ap.add_argument("--max-seconds", type=float, default=120.0, help="运行时预算：墙钟上限")
     ap.add_argument("--history", default=None, help="历史文件路径（默认 snapshots/history.jsonl）")
     ap.add_argument("--no-history", action="store_true", help="本次不写历史、也不做趋势分析")
     ap.add_argument("--trend", action="store_true", help="打印趋势详情（含'为什么没给预测'）")
+    ap.add_argument("--llm-input", choices=["events", "full"], default="events",
+                    help="喂模型的输入：events=收敛后的事件表（默认，更短且因果已判定）；full=原始快照+平铺发现")
+    ap.add_argument("--explain-graph", action="store_true",
+                    help="打印收敛用的因果图（给人审计/推翻），然后退出")
     # ── 成本控制（监控是反复跑的：单次便宜不够，要"重复也不花钱"）──
     ap.add_argument("--no-cache", action="store_true", help="不用归因缓存（强制重新归因）")
     ap.add_argument("--cache", default=None, help="归因缓存文件路径")
@@ -81,6 +107,14 @@ def main():
     ap.add_argument("--quiet-if-ok", action="store_true",
                     help="无发现时只打一行（给 cron 用：配合缓存让巡检几乎零成本）")
     args = ap.parse_args()
+
+    # 因果图审计：让人能看、能质疑、能推翻我们的归因（比"AI 说的"更值得信任）
+    if args.explain_graph:
+        print(conv_mod.explain_graph())
+        probs = conv_mod.check_graph()
+        print("\n因果图自检：" + ("通过（无环、规则齐全、无反例矛盾）" if not probs
+                              else "**未通过** " + "；".join(probs)))
+        return 0
 
     # ── 1. 采集（或读已有快照）───────────────────────────────
     t0 = time.time()
@@ -117,15 +151,29 @@ def main():
 
     text = C.render(snap, findings)
 
+    # ── 1.5 告警收敛：把"一次故障 N 条告警"收敛成"N 个事件 + 根因/连带" ──────
+    # 企业调研里排第一的痛点不是"没有告警"，是"一次故障几十条告警，真信号被埋掉"。
+    # 这一步**全是确定性计算、0 token**：因果由代码判定（可复现、可审计、可推翻），
+    # 模型只在收敛后的结果上做措辞与优先级 —— 不让它自己推理因果。
+    events, conv_report = conv_mod.converge(findings, snap)
+
+    # 喂模型的输入：默认用**事件表**（更短，且因果已判定好）
+    prompt_text = (conv_mod.render_for_llm(events, conv_report, snap=snap)
+                   if args.llm_input == "events" else text)
+    attrib_sys = ATTRIB_SYS_EVENTS if args.llm_input == "events" else ATTRIB_SYS
+
     # ── 2. 成本控制：缓存 → 模型分级 → 小时限额 ─────────────────
     # 监控是反复跑的：这一步决定了"状态没变时会不会白花钱"。
-    fp = cost_mod.findings_fingerprint(findings, extra={"worst": ["ok", "warning", "critical"][sev]})
+    fp = cost_mod.findings_fingerprint(
+        findings, extra={"worst": ["ok", "warning", "critical"][sev],
+                         "input": args.llm_input})   # ★ 输入模式不同 → 归因也不同，指纹必须区分
     cache = cost_mod.AttributionCache(args.cache or cost_mod.DEFAULT_CACHE, args.cache_ttl)
     ledger = cost_mod.CostLedger(args.cost or cost_mod.DEFAULT_LEDGER, args.hourly_token_limit)
     cheap = args.model_cheap or d32_model()
     strong = args.model_strong or d32_model()
 
     report, model_used, cached_hit, tokens_in, tokens_out, blocked = None, "", False, 0, 0, ""
+    attempts, wasted = 0, 0
     cached_entry = None if args.no_cache else cache.get(fp)
 
     if args.no_llm:
@@ -145,7 +193,7 @@ def main():
             import day32_function_calling as d32
             import context as ctx
 
-            est = int(len(text) / 2.4) + 600      # 与 context.py 的保守估算一致
+            est = int(len(prompt_text) / 2.4) + 600   # 与 context.py 的保守估算一致
             allowed, why = ledger.allow(est)
             if not allowed:
                 blocked = why                     # ★ 限额刹车：只出规则结论，不偷偷花钱
@@ -154,28 +202,38 @@ def main():
                 budget = budget_mod.Budget(max_llm_calls=args.max_calls, max_tool_calls=4,
                                            max_seconds=args.max_seconds, label="live")
                 meter = []
-                llm = ctx.make_llm(d32.make_client(), model_used, usage_sink=meter, label="attrib")
+                llm = ctx.make_llm(d32.make_client(), model_used, usage_sink=meter,
+                                   label="attrib", max_tokens=args.max_output_tokens)
                 tracer = trace_util.make_tracer(f"live-{snap.get('host')}", uuid.uuid4().hex[:6])
                 try:
-                    budget.reserve_llm(len(text))          # 运行时预算：防单次跑飞
+                    budget.reserve_llm(len(prompt_text))   # 运行时预算：防单次跑飞
                     with tracer.span("attribute", as_type="chain", host=snap.get("host"),
                                      model=model_used) as sp:
-                        report = llm(ATTRIB_SYS, text)
-                        sp.set(out_chars=len(report))
+                        report = llm(attrib_sys, prompt_text)
+                        sp.set(out_chars=len(report), input_mode=args.llm_input,
+                               events=conv_report["events"])
                     tracer.flush()
                 except budget_mod.BudgetExceeded as e:
                     report = f"（预算刹车，未做归因：{e.reason}）"
                 if meter:
-                    u = meter[-1]
+                    # ★ 汇总**全部尝试**，不是只取最后一次：
+                    # 推理型模型上限偏小时会把预算烧在推理上、正文为空 → 自动放大重试，
+                    # 那次是**真花了钱**的。只记 meter[-1] 就是成本工具自己漏记成本。
+                    u = cost_mod.summarize_usage(meter)
+                    attempts, wasted = u["attempts"], u["wasted_completion_tokens"]
                     tokens_in, tokens_out = u["prompt_tokens"], u["completion_tokens"]
                     model_used = f"{model_used}｜prompt {tokens_in} / 输出 {tokens_out} token"
+                    if attempts > 1:
+                        model_used += (f"（{attempts} 次尝试，含空正文重试，"
+                                       f"白烧 {wasted} token）")
                     if not args.no_cache:
                         cache.put(fp, report, model=model_used,
                                   tokens_in=tokens_in, tokens_out=tokens_out)
 
     ledger.record(snap.get("host"), calls=0 if (cached_hit or blocked or args.no_llm) else 1,
                   tokens_in=tokens_in, tokens_out=tokens_out, cached=cached_hit,
-                  model=model_used, seconds=time.time() - t0)
+                  model=model_used, seconds=time.time() - t0,
+                  attempts=attempts, wasted=wasted)
 
     # ── 3. 结构化结果（监视器/告警管道要的是这个，不是散文）────
     result = {
@@ -183,8 +241,12 @@ def main():
         "source": src, "collect_seconds": snap.get("collect_seconds"),
         "findings": findings, "worst_severity": ["ok", "warning", "critical"][sev],
         "exit_code": sev, "report": report, "approved": [], "note": "",
+        # 收敛结果：一个故障一个事件 + 根因/连带（接告警管道时**优先用这个**，不是平铺发现）
+        "convergence": {"report": conv_report, "events": events},
         "cost": {"cached": cached_hit, "model": model_used, "blocked": blocked,
                  "tokens_in": tokens_in, "tokens_out": tokens_out,
+                 "input_mode": args.llm_input, "input_chars": len(prompt_text),
+                 "attempts": attempts, "wasted_tokens": wasted,
                  "ledger": ledger.summary(args.price_in, args.price_out)},
         "trend": {"history_samples": len(recs),
                   "signals": [f for f in trend_findings],
@@ -199,6 +261,10 @@ def main():
         print("=" * 86)
         print(f"真机体检（{src}）｜主机 {snap.get('host')}｜{snap.get('collected_at')}")
         print("=" * 86)
+        # 收敛放在最前面：值班的人先看"几个故障"，而不是先看"N 条告警"
+        if events:
+            print(conv_mod.render(events, conv_report))
+            print("\n" + "-" * 86)
         print(text)
         if not args.no_history and (args.trend or trend_findings):
             print(f"\n【趋势】{trend_mod.explain(recs)}")
@@ -212,11 +278,19 @@ def main():
         print("\n" + cost_mod.render_cost(result["cost"]["ledger"]))
 
         # ── 5. 人机确认：处置动作要人批（本工具只给建议，不执行）──────
+        # ★ 动作**按事件去重**：一次故障一个动作，而不是 N 条告警 N 个动作 ——
+        #   收敛的价值最后就落在这一张清单上（运维批的是故障，不是告警）。
         if findings:
-            actions = [f"{f['severity'].upper()} {f['rule']} @ {f['subject']}：{f['suggestion']}"
-                       for f in findings]
+            actions = []
+            for e in events:
+                head = f"{e['severity'].upper()} {e['event_id']} {e['title']}"
+                if e["root"]:
+                    actions.append(f"{head}｜根因 {e['root']['rule']} → {e['next_action']}")
+                else:
+                    actions.append(f"{head} → {e['next_action']}")
             print("\n" + "-" * 86)
-            print("以下处置动作带有副作用，需要人批准（本工具**只列建议，不执行**）：")
+            print(f"以下处置动作带有副作用，需要人批准（本工具**只列建议，不执行**）"
+                  f"｜{len(findings)} 条发现收敛为 {len(actions)} 个待批动作：")
             for a in actions:
                 print(f"  · {a}")
             if args.yes:
@@ -232,7 +306,8 @@ def main():
         print(f"\n结构化结果：{args.json_out}")
 
     worst = result["worst_severity"]
-    print(f"\n结论：{worst}（发现 {len(findings)} 条，用时 {time.time() - t0:.1f}s，退出码 {sev}"
+    print(f"\n结论：{worst}（发现 {len(findings)} 条 → 事件 {len(events)} 个，"
+          f"用时 {time.time() - t0:.1f}s，退出码 {sev}"
           f"{'｜缓存命中' if cached_hit else ''}{'｜限额刹车' if blocked else ''}）")
     return sev
 

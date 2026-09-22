@@ -20,6 +20,9 @@ import sys
 import json
 import time
 
+# 直接跑这些脚本时也必须不依赖控制台代码页（Windows GBK 下 ✓/✗ 直接抛 UnicodeEncodeError）
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import collect as C
 

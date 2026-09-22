@@ -138,6 +138,45 @@ def choose_model(severity, n_findings, cheap_model, strong_model,
     return cheap_model
 
 
+def summarize_usage(meter):
+    """把 `ctx.make_llm` 的 usage_sink 汇总成**真实总量**（含重试烧掉的那部分）。
+
+    ★ 实测踩到的记账 bug：原来只取 `meter[-1]`，也就是"最后一次尝试成功的那次"。
+    但推理型模型在 `max_tokens` 偏小时会**把预算全烧在推理上、正文为空**，触发自动放大重试
+    （见 context.make_llm 的空正文守卫）。于是账本里只有成功那次，
+    **废掉的那次 2000 token 被悄悄漏掉了** —— 成本工具自己漏记成本，是最不能接受的 bug：
+    它会让你以为省了，其实没省。
+
+    ★ 附带实测（同一个提示词、同一台机器、真实 API）：
+        max_tokens=2000 → 1 次尝试，推理 1118 字，正文 583 字，completion 1069
+        max_tokens=4000 → 1 次尝试，推理 4131 字，正文 445 字，completion 2833
+    推理 token 是**弹性**的：上限给得越大它想得越久，**正文反而更短**。
+    所以上限不能"越大越安全"，得按任务实测调 —— 而调的依据就是这里汇总出来的数字。
+    """
+    if not meter:
+        return {"attempts": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                "total_tokens": 0, "wasted_completion_tokens": 0, "wasted_ratio": 0.0,
+                "reasoning_chars": 0, "content_chars": 0, "per_attempt": []}
+    comp = sum(m.get("completion_tokens", 0) for m in meter)
+    prom = sum(m.get("prompt_tokens", 0) for m in meter)
+    wasted = sum(m.get("completion_tokens", 0) for m in meter
+                 if not m.get("content_chars"))          # 正文为空 = 这一次白烧
+    return {
+        "attempts": len(meter),
+        "prompt_tokens": prom, "completion_tokens": comp, "total_tokens": prom + comp,
+        "wasted_completion_tokens": wasted,
+        "wasted_ratio": round(wasted / comp, 3) if comp else 0.0,
+        "reasoning_chars": sum(m.get("reasoning_chars", 0) for m in meter),
+        "content_chars": meter[-1].get("content_chars", 0),
+        "per_attempt": [{"attempt": m.get("attempt"), "max_tokens": m.get("max_tokens"),
+                         "prompt_tokens": m.get("prompt_tokens"),
+                         "completion_tokens": m.get("completion_tokens"),
+                         "content_chars": m.get("content_chars"),
+                         "reasoning_chars": m.get("reasoning_chars"),
+                         "finish_reason": m.get("finish_reason")} for m in meter],
+    }
+
+
 # ══════════════════════════════════════════════════════════════════
 # ③ 成本账本（跨运行）
 # ══════════════════════════════════════════════════════════════════
@@ -153,10 +192,12 @@ class CostLedger:
         self.hourly_token_limit = hourly_token_limit
 
     def record(self, host, calls=0, tokens_in=0, tokens_out=0, cached=False,
-               model="", seconds=0.0):
+               model="", seconds=0.0, attempts=0, wasted=0):
         rec = {"ts": time.time(), "iso": time.strftime("%Y-%m-%d %H:%M:%S"), "host": host,
                "calls": calls, "tokens_in": tokens_in, "tokens_out": tokens_out,
-               "cached": bool(cached), "model": model, "seconds": round(seconds, 2)}
+               "cached": bool(cached), "model": model, "seconds": round(seconds, 2),
+               # ★ 重试也要记账：否则"白烧的 token"永远看不见（实测踩到过）
+               "attempts": attempts, "wasted_tokens": wasted}
         os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -204,7 +245,10 @@ class CostLedger:
                "tokens_in_today": tin, "tokens_out_today": tout,
                "tokens_total_today": tin + tout,
                "cached_runs_today": sum(1 for r in day if r.get("cached")),
-               "tokens_last_hour": sum(r["tokens_in"] + r["tokens_out"] for r in hour)}
+               "tokens_last_hour": sum(r["tokens_in"] + r["tokens_out"] for r in hour),
+               # 重试浪费：账本要能回答"有多少 token 是白烧的"（老记录没这两列，按 0 算）
+               "retry_runs_today": sum(1 for r in day if (r.get("attempts") or 0) > 1),
+               "wasted_tokens_today": sum(r.get("wasted_tokens") or 0 for r in day)}
         # 只有调用方给了单价才算钱（不内置价格：供应商随时调价，编一个数是骗人）
         if price_in or price_out:
             out["cost_today"] = round(tin / 1e6 * price_in + tout / 1e6 * price_out, 4)
@@ -219,6 +263,10 @@ def render_cost(summary):
     lines = [f"成本账本：今日 {summary['runs_today']} 次体检（其中缓存命中 "
              f"{summary['cached_runs_today']} 次）｜模型调用 {summary['calls_today']} 次｜"
              f"token {summary['tokens_total_today']}（本小时 {summary['tokens_last_hour']}）"]
+    if summary.get("wasted_tokens_today"):
+        lines.append(f"  ⚠ 其中重试白烧 {summary['wasted_tokens_today']} token"
+                     f"（{summary['retry_runs_today']} 次运行触发了空正文重试）"
+                     " —— 说明输出上限偏小，可调 --max-output-tokens 试")
     if summary["cost_today"] is not None:
         lines.append(f"  估算费用：{summary['cost_today']}（{summary['price_note']}）")
     else:
