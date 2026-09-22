@@ -40,6 +40,7 @@ import collect as C
 import trend as trend_mod
 import cost as cost_mod
 import converge as conv_mod
+import feedback as fb_mod
 import budget as budget_mod
 import trace_util
 
@@ -106,7 +107,26 @@ def main():
     ap.add_argument("--price-out", type=float, default=0.0, help="输出单价（每百万 token，自行填）")
     ap.add_argument("--quiet-if-ok", action="store_true",
                     help="无发现时只打一行（给 cron 用：配合缓存让巡检几乎零成本）")
+    # ── 误报反馈与抑制（企业调研里的"反馈闭环"：误报没人标记 → 工具不会越用越准）──
+    ap.add_argument("--feedback", default=None, help="反馈记录文件（默认 snapshots/feedback.jsonl）")
+    ap.add_argument("--suppression-state", default=None, help="抑制命中计数文件")
+    ap.add_argument("--no-suppress", action="store_true", help="本次忽略抑制规则（排查时用）")
+    ap.add_argument("--min-marks", type=int, default=None,
+                    help="抑制生效所需最少标记数（默认 exact=1、prefix/rule=2）")
+    ap.add_argument("--mark-fp", action="append", default=None, metavar="RULE@SUBJECT",
+                    help="把本次的这条发现标成误报（可多次）；先看报告再标")
+    ap.add_argument("--fp-reason", default=None,
+                    help="误报理由（**标记时必填**，否则半年后没人敢撤销）")
+    ap.add_argument("--fp-match", default="exact", choices=["exact", "prefix", "rule"],
+                    help="抑制范围：exact（默认，只压同一对象）/ prefix / rule")
+    ap.add_argument("--fp-wide", action="store_true", help="允许 prefix/rule 宽匹配（要更多证据）")
+    ap.add_argument("--fp-hours", type=int, default=168,
+                    help="抑制有效期小时数（默认 7 天；**不允许永久抑制**）")
     args = ap.parse_args()
+
+    if args.mark_fp and not (args.fp_reason or "").strip():
+        print("拒绝标记：--mark-fp 必须同时给 --fp-reason（**理由必填**，否则半年后没人敢撤销）")
+        return 2
 
     # 因果图审计：让人能看、能质疑、能推翻我们的归因（比"AI 说的"更值得信任）
     if args.explain_graph:
@@ -149,23 +169,49 @@ def main():
             # ★ 预测也影响退出码：监控因此能**提前**报警，而不是等阈值被击穿
             sev = max(sev, max(SEVERITY_EXIT.get(f["severity"], 0) for f in trend_findings))
 
-    text = C.render(snap, findings)
+    # ── 1.4 误报反馈：人工标记的抑制规则（**不删除，只标注**）────────────
+    # 顺序很重要：**先抑制、再收敛**。这样事件里不会混进已被人工确认的噪声，
+    # 退出码也只由「保留」的发现决定；而被抑制的发现**照旧打印出来**（抑制 ≠ 删除）。
+    fb_store = fb_mod.FeedbackStore(args.feedback or fb_mod.DEFAULT_FEEDBACK)
+    sup_state = fb_mod.SuppressionState(args.suppression_state or fb_mod.DEFAULT_STATE)
+    marked = []
+    for sel in (args.mark_fp or []):
+        marked.extend(_mark_one(fb_store, sel, args, snap, findings))
+    sup_rules, sup_rejected = fb_mod.build_suppressions(fb_store.load(), min_marks=args.min_marks)
+    kept, suppressed = ((list(findings), []) if args.no_suppress
+                        else fb_mod.apply_suppressions(findings, snap.get("host"), sup_rules))
+    # 运行时自检：抑制**绝对不能**让发现消失（这是本模块的头号纪律）
+    if len(kept) + len(suppressed) != len(findings):
+        raise RuntimeError(f"抑制模块破坏了完整性：{len(kept)} + {len(suppressed)} "
+                           f"!= {len(findings)}（这是 bug，不是数据问题）")
+    sev = max((SEVERITY_EXIT.get(f["severity"], 0) for f in kept), default=0)
+    if suppressed:
+        sup_state.record(suppressed, host=snap.get("host"))
+    sup_stats, sup_notes = fb_mod.audit_suppressions(sup_rules, sup_state)
+    text = C.render(snap, kept)
 
     # ── 1.5 告警收敛：把"一次故障 N 条告警"收敛成"N 个事件 + 根因/连带" ──────
     # 企业调研里排第一的痛点不是"没有告警"，是"一次故障几十条告警，真信号被埋掉"。
     # 这一步**全是确定性计算、0 token**：因果由代码判定（可复现、可审计、可推翻），
     # 模型只在收敛后的结果上做措辞与优先级 —— 不让它自己推理因果。
-    events, conv_report = conv_mod.converge(findings, snap)
+    events, conv_report = conv_mod.converge(kept, snap)
 
     # 喂模型的输入：默认用**事件表**（更短，且因果已判定好）
     prompt_text = (conv_mod.render_for_llm(events, conv_report, snap=snap)
                    if args.llm_input == "events" else text)
+    if suppressed:
+        # 告诉模型"这些已被人工确认是误报"，免得它又去为它们出建议
+        # （注意：是**告诉**它，不是让它判断 —— 抑制只能来自人的显式标记）
+        prompt_text += (f"\n另有 {len(suppressed)} 条已被人工确认是误报并抑制"
+                        f"（不要为它们出建议）："
+                        + "、".join(f"{s['rule']}@{s['subject']}" for s in suppressed))
     attrib_sys = ATTRIB_SYS_EVENTS if args.llm_input == "events" else ATTRIB_SYS
 
     # ── 2. 成本控制：缓存 → 模型分级 → 小时限额 ─────────────────
     # 监控是反复跑的：这一步决定了"状态没变时会不会白花钱"。
     fp = cost_mod.findings_fingerprint(
-        findings, extra={"worst": ["ok", "warning", "critical"][sev],
+        # 按**保留**的发现算指纹：抑制状态变了，归因也该重算
+        kept, extra={"worst": ["ok", "warning", "critical"][sev],
                          "input": args.llm_input})   # ★ 输入模式不同 → 归因也不同，指纹必须区分
     cache = cost_mod.AttributionCache(args.cache or cost_mod.DEFAULT_CACHE, args.cache_ttl)
     ledger = cost_mod.CostLedger(args.cost or cost_mod.DEFAULT_LEDGER, args.hourly_token_limit)
@@ -239,8 +285,13 @@ def main():
     result = {
         "host": snap.get("host"), "collected_at": snap.get("collected_at"),
         "source": src, "collect_seconds": snap.get("collect_seconds"),
-        "findings": findings, "worst_severity": ["ok", "warning", "critical"][sev],
+        "findings": kept, "worst_severity": ["ok", "warning", "critical"][sev],
         "exit_code": sev, "report": report, "approved": [], "note": "",
+        # 抑制信息：被抑制的发现**照旧在 JSON 里**，带来源/理由/到期（可审计）
+        "suppressed": suppressed,
+        "suppressions": {"active": sup_rules, "rejected": sup_rejected,
+                         "marked_this_run": [m.get("id") for m in marked],
+                         "stats": sup_stats, "health_notes": sup_notes},
         # 收敛结果：一个故障一个事件 + 根因/连带（接告警管道时**优先用这个**，不是平铺发现）
         "convergence": {"report": conv_report, "events": events},
         "cost": {"cached": cached_hit, "model": model_used, "blocked": blocked,
@@ -255,7 +306,10 @@ def main():
 
     # ── 4. 输出（安静模式：无发现时一行收工，给 cron 用）──────────
     if args.quiet_if_ok and sev == 0:
-        print(f"{snap.get('host')} OK｜发现 0 条｜"
+        # ⚠ 只打"发现 0 条"会让人以为真的什么都没检出 —— 被抑制的也算"看到过什么"。
+        #   "看起来健康"和"确实健康"是两回事，输出里不许混为一谈。
+        print(f"{snap.get('host')} OK｜发现 {len(kept)} 条"
+              f"{f'（另 {len(suppressed)} 条已抑制）' if suppressed else ''}｜"
               f"{'缓存命中' if cached_hit else '未调模型'}｜token {tokens_in + tokens_out}")
     else:
         print("=" * 86)
@@ -264,6 +318,19 @@ def main():
         # 收敛放在最前面：值班的人先看"几个故障"，而不是先看"N 条告警"
         if events:
             print(conv_mod.render(events, conv_report))
+            print("\n" + "-" * 86)
+        if suppressed:
+            print(fb_mod.render_suppressed(suppressed, sup_rules, total=len(findings)))
+            print("\n" + "-" * 86)
+        if sup_rules:
+            print(fb_mod.render_rules(sup_rules, sup_rejected, sup_state))
+            # ★ 危险信号必须在**运行时**就摆出来（只在 CLI 自检里报等于没人看）：
+            #   比如"这条规则的天花板是 critical"——它能压住最严重的那一档，必须是有意为之
+            sup_problems = fb_mod.check_suppressions(sup_rules)
+            if sup_problems:
+                print("  ⚠ 抑制规则自检有问题（**先确认这不是把监控关掉**）：")
+                for p in sup_problems:
+                    print(f"    · {p}")
             print("\n" + "-" * 86)
         print(text)
         if not args.no_history and (args.trend or trend_findings):
@@ -280,7 +347,7 @@ def main():
         # ── 5. 人机确认：处置动作要人批（本工具只给建议，不执行）──────
         # ★ 动作**按事件去重**：一次故障一个动作，而不是 N 条告警 N 个动作 ——
         #   收敛的价值最后就落在这一张清单上（运维批的是故障，不是告警）。
-        if findings:
+        if kept:
             actions = []
             for e in events:
                 head = f"{e['severity'].upper()} {e['event_id']} {e['title']}"
@@ -290,7 +357,8 @@ def main():
                     actions.append(f"{head} → {e['next_action']}")
             print("\n" + "-" * 86)
             print(f"以下处置动作带有副作用，需要人批准（本工具**只列建议，不执行**）"
-                  f"｜{len(findings)} 条发现收敛为 {len(actions)} 个待批动作：")
+                  f"｜{len(findings)} 条发现（其中 {len(suppressed)} 条已抑制）"
+                  f"收敛为 {len(actions)} 个待批动作：")
             for a in actions:
                 print(f"  · {a}")
             if args.yes:
@@ -306,10 +374,39 @@ def main():
         print(f"\n结构化结果：{args.json_out}")
 
     worst = result["worst_severity"]
-    print(f"\n结论：{worst}（发现 {len(findings)} 条 → 事件 {len(events)} 个，"
+    print(f"\n结论：{worst}（发现 {len(findings)} 条"
+          f"{f'，其中 {len(suppressed)} 条已抑制' if suppressed else ''}"
+          f" → 事件 {len(events)} 个，"
           f"用时 {time.time() - t0:.1f}s，退出码 {sev}"
           f"{'｜缓存命中' if cached_hit else ''}{'｜限额刹车' if blocked else ''}）")
     return sev
+
+
+def _mark_one(store, sel, args, snap, findings):
+    """把一次 `--mark-fp RULE@SUBJECT` 落成反馈记录。
+
+    只允许标记**本次确实出现过的发现**：手打一个不存在的规则名会让后续规则永远命中不了
+    —— 那会表现为"标记了但什么都没压住"，最容易被误当成"已经生效了"。
+    """
+    rule, _, subject = sel.partition("@")
+    hit = [f for f in findings
+           if f.get("rule") == rule and (not subject or str(f.get("subject")) == subject)]
+    if not hit:
+        print(f"⚠ --mark-fp {sel} 在本次发现里找不到对应项 → **不记录**"
+              f"（避免造出一条永远不生效的规则）")
+        return []
+    recs = []
+    for f in hit:
+        try:
+            recs.append(store.add(snap.get("host") or "", rule, f.get("subject"),
+                                  f.get("severity", "warning"), reason=args.fp_reason,
+                                  match=args.fp_match, hours=args.fp_hours,
+                                  wide=args.fp_wide))
+            print(f"✓ 已记录误报 {recs[-1]['id']}：{rule} @ {f.get('subject')}"
+                  f"（{args.fp_match}，{args.fp_hours} 小时后过期）")
+        except ValueError as e:
+            print(f"⚠ 拒绝记录 {sel}：{e}")
+    return recs
 
 
 def d32_model():
