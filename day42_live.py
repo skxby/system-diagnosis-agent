@@ -38,6 +38,7 @@ load_dotenv(os.path.join(HERE, ".env"))
 
 import collect as C
 import trend as trend_mod
+import cost as cost_mod
 import budget as budget_mod
 import trace_util
 
@@ -66,6 +67,19 @@ def main():
     ap.add_argument("--history", default=None, help="历史文件路径（默认 snapshots/history.jsonl）")
     ap.add_argument("--no-history", action="store_true", help="本次不写历史、也不做趋势分析")
     ap.add_argument("--trend", action="store_true", help="打印趋势详情（含'为什么没给预测'）")
+    # ── 成本控制（监控是反复跑的：单次便宜不够，要"重复也不花钱"）──
+    ap.add_argument("--no-cache", action="store_true", help="不用归因缓存（强制重新归因）")
+    ap.add_argument("--cache", default=None, help="归因缓存文件路径")
+    ap.add_argument("--cache-ttl", type=int, default=1800, help="缓存有效期（秒，默认 30 分钟）")
+    ap.add_argument("--model-cheap", default=None, help="便宜档模型名（仅 warning 时用）")
+    ap.add_argument("--model-strong", default=None, help="强档模型名（critical 或发现≥5 时用）")
+    ap.add_argument("--cost", default=None, help="成本账本文件路径")
+    ap.add_argument("--hourly-token-limit", type=int, default=None,
+                    help="每小时 token 限额：超了就不再调模型，只出规则结论")
+    ap.add_argument("--price-in", type=float, default=0.0, help="输入单价（每百万 token，自行填）")
+    ap.add_argument("--price-out", type=float, default=0.0, help="输出单价（每百万 token，自行填）")
+    ap.add_argument("--quiet-if-ok", action="store_true",
+                    help="无发现时只打一行（给 cron 用：配合缓存让巡检几乎零成本）")
     args = ap.parse_args()
 
     # ── 1. 采集（或读已有快照）───────────────────────────────
@@ -103,74 +117,114 @@ def main():
 
     text = C.render(snap, findings)
 
-    print("=" * 86)
-    print(f"真机体检（{src}）｜主机 {snap.get('host')}｜{snap.get('collected_at')}")
-    print("=" * 86)
-    print(text)
-    if not args.no_history:
-        print(f"\n【趋势】{trend_mod.explain(recs) if (args.trend or trend_findings) else ''}".rstrip())
+    # ── 2. 成本控制：缓存 → 模型分级 → 小时限额 ─────────────────
+    # 监控是反复跑的：这一步决定了"状态没变时会不会白花钱"。
+    fp = cost_mod.findings_fingerprint(findings, extra={"worst": ["ok", "warning", "critical"][sev]})
+    cache = cost_mod.AttributionCache(args.cache or cost_mod.DEFAULT_CACHE, args.cache_ttl)
+    ledger = cost_mod.CostLedger(args.cost or cost_mod.DEFAULT_LEDGER, args.hourly_token_limit)
+    cheap = args.model_cheap or d32_model()
+    strong = args.model_strong or d32_model()
 
-    # ── 2. 结构化结果（监视器/告警管道要的是这个，不是散文）────
+    report, model_used, cached_hit, tokens_in, tokens_out, blocked = None, "", False, 0, 0, ""
+    cached_entry = None if args.no_cache else cache.get(fp)
+
+    if args.no_llm:
+        report = "（--no-llm：只出规则结论）"
+    elif cached_entry:
+        # ★ 状态没变 → 复用上次归因，0 次调用
+        report, cached_hit = cached_entry["text"], True
+    elif not findings:
+        # 健康时不叫模型 —— 省钱，而且"没有异常"本来就是程序结论（Day 34 的程序网关同一条理）
+        report = "规则未发现异常（**只代表已采集到的维度**）。无需模型归因。"
+    else:
+        model_used = cost_mod.choose_model(["ok", "warning", "critical"][sev], len(findings),
+                                           cheap, strong)
+        if not os.environ.get("DEEPSEEK_API_KEY"):
+            report = "（.env 里没有 DEEPSEEK_API_KEY，跳过归因；规则结论不受影响）"
+        else:
+            import day32_function_calling as d32
+            import context as ctx
+
+            est = int(len(text) / 2.4) + 600      # 与 context.py 的保守估算一致
+            allowed, why = ledger.allow(est)
+            if not allowed:
+                blocked = why                     # ★ 限额刹车：只出规则结论，不偷偷花钱
+                report = f"（小时限额刹车，未做归因：{why}）"
+            else:
+                budget = budget_mod.Budget(max_llm_calls=args.max_calls, max_tool_calls=4,
+                                           max_seconds=args.max_seconds, label="live")
+                meter = []
+                llm = ctx.make_llm(d32.make_client(), model_used, usage_sink=meter, label="attrib")
+                tracer = trace_util.make_tracer(f"live-{snap.get('host')}", uuid.uuid4().hex[:6])
+                try:
+                    budget.reserve_llm(len(text))          # 运行时预算：防单次跑飞
+                    with tracer.span("attribute", as_type="chain", host=snap.get("host"),
+                                     model=model_used) as sp:
+                        report = llm(ATTRIB_SYS, text)
+                        sp.set(out_chars=len(report))
+                    tracer.flush()
+                except budget_mod.BudgetExceeded as e:
+                    report = f"（预算刹车，未做归因：{e.reason}）"
+                if meter:
+                    u = meter[-1]
+                    tokens_in, tokens_out = u["prompt_tokens"], u["completion_tokens"]
+                    model_used = f"{model_used}｜prompt {tokens_in} / 输出 {tokens_out} token"
+                    if not args.no_cache:
+                        cache.put(fp, report, model=model_used,
+                                  tokens_in=tokens_in, tokens_out=tokens_out)
+
+    ledger.record(snap.get("host"), calls=0 if (cached_hit or blocked or args.no_llm) else 1,
+                  tokens_in=tokens_in, tokens_out=tokens_out, cached=cached_hit,
+                  model=model_used, seconds=time.time() - t0)
+
+    # ── 3. 结构化结果（监视器/告警管道要的是这个，不是散文）────
     result = {
         "host": snap.get("host"), "collected_at": snap.get("collected_at"),
         "source": src, "collect_seconds": snap.get("collect_seconds"),
         "findings": findings, "worst_severity": ["ok", "warning", "critical"][sev],
-        "exit_code": sev, "report": None, "approved": [], "note": "",
+        "exit_code": sev, "report": report, "approved": [], "note": "",
+        "cost": {"cached": cached_hit, "model": model_used, "blocked": blocked,
+                 "tokens_in": tokens_in, "tokens_out": tokens_out,
+                 "ledger": ledger.summary(args.price_in, args.price_out)},
         "trend": {"history_samples": len(recs),
                   "signals": [f for f in trend_findings],
                   "history_path": None if args.no_history else history_path},
     }
 
-    if args.no_llm:
-        result["report"] = "（--no-llm：只出规则结论）"
-    elif not findings:
-        # 健康时不叫模型 —— 省钱，而且"没有异常"本来就是程序结论（Day 34 的程序网关同一条理）
-        result["report"] = "规则未发现异常（**只代表已采集到的维度**）。无需模型归因。"
-        print("\n" + result["report"])
+    # ── 4. 输出（安静模式：无发现时一行收工，给 cron 用）──────────
+    if args.quiet_if_ok and sev == 0:
+        print(f"{snap.get('host')} OK｜发现 0 条｜"
+              f"{'缓存命中' if cached_hit else '未调模型'}｜token {tokens_in + tokens_out}")
     else:
-        if not os.environ.get("DEEPSEEK_API_KEY"):
-            print("\n错误：.env 里没有 DEEPSEEK_API_KEY（或用 --no-llm）")
-            return sev
-        import day32_function_calling as d32
-        import context as ctx
-
-        budget = budget_mod.Budget(max_llm_calls=args.max_calls, max_tool_calls=4,
-                                   max_seconds=args.max_seconds, label="live")
-        meter = []
-        llm = ctx.make_llm(d32.make_client(), d32.MODEL, usage_sink=meter, label="attrib")
-        tracer = trace_util.make_tracer(f"live-{snap.get('host')}", uuid.uuid4().hex[:6])
-        try:
-            budget.reserve_llm(len(text))          # 预算准入：真机体检也要防跑飞
-            with tracer.span("attribute", as_type="chain", host=snap.get("host")) as sp:
-                report = llm(ATTRIB_SYS, text)
-                sp.set(out_chars=len(report))
-            tracer.flush()
-        except budget_mod.BudgetExceeded as e:
-            report = f"（预算刹车，未做归因：{e.reason}）"
-        if meter:
-            u = meter[-1]
-            print(f"\n（归因调用：prompt {u['prompt_tokens']} token / 输出 {u['completion_tokens']} token，"
-                  f"finish={u['finish_reason']}）")
-        result["report"] = report
+        print("=" * 86)
+        print(f"真机体检（{src}）｜主机 {snap.get('host')}｜{snap.get('collected_at')}")
+        print("=" * 86)
+        print(text)
+        if not args.no_history and (args.trend or trend_findings):
+            print(f"\n【趋势】{trend_mod.explain(recs)}")
         print("\n" + "=" * 86)
         print("归因与处置优先级（在规则发现之上）")
         print("=" * 86)
+        if cached_hit:
+            print(f"⚡ 命中归因缓存（{cached_entry.get('age_seconds')} 秒前，"
+                  f"指纹 {fp} 未变）→ **0 次模型调用**")
         print(report)
+        print("\n" + cost_mod.render_cost(result["cost"]["ledger"]))
 
-    # ── 3. 人机确认：处置动作要人批（本工具只给建议，不执行）──────
-    if findings:
-        actions = [f"{f['severity'].upper()} {f['rule']} @ {f['subject']}：{f['suggestion']}"
-                   for f in findings]
-        print("\n" + "-" * 86)
-        print("以下处置动作带有副作用，需要人批准（本工具**只列建议，不执行**）：")
-        for a in actions:
-            print(f"  · {a}")
-        if args.yes:
-            result["approved"] = actions
-            result["note"] = "自动批准（--yes，巡检模式）"
-            print("→ 已自动批准（--yes）。真实环境应接 Ansible/SSH 执行层，且执行层自己做二次校验。")
-        else:
-            print("→ 未批准：请在真实运维流程里走审批（本工具不提供执行能力，这是刻意的边界）。")
+        # ── 5. 人机确认：处置动作要人批（本工具只给建议，不执行）──────
+        if findings:
+            actions = [f"{f['severity'].upper()} {f['rule']} @ {f['subject']}：{f['suggestion']}"
+                       for f in findings]
+            print("\n" + "-" * 86)
+            print("以下处置动作带有副作用，需要人批准（本工具**只列建议，不执行**）：")
+            for a in actions:
+                print(f"  · {a}")
+            if args.yes:
+                result["approved"] = actions
+                result["note"] = "自动批准（--yes，巡检模式）"
+                print("→ 已自动批准（--yes）。真实环境应接 Ansible/SSH 执行层，且执行层自己做二次校验。")
+            else:
+                print("→ 未批准：请在真实运维流程里走审批（本工具不提供执行能力，这是刻意的边界）。")
 
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as f:
@@ -178,8 +232,15 @@ def main():
         print(f"\n结构化结果：{args.json_out}")
 
     worst = result["worst_severity"]
-    print(f"\n结论：{worst}（发现 {len(findings)} 条，用时 {time.time() - t0:.1f}s，退出码 {sev}）")
+    print(f"\n结论：{worst}（发现 {len(findings)} 条，用时 {time.time() - t0:.1f}s，退出码 {sev}"
+          f"{'｜缓存命中' if cached_hit else ''}{'｜限额刹车' if blocked else ''}）")
     return sev
+
+
+def d32_model():
+    """当前已核验的模型名（不写死"更强的型号"：供应商型号随时变，写死会变成文档里的谎言）"""
+    import day32_function_calling as d32
+    return d32.MODEL
 
 
 if __name__ == "__main__":
