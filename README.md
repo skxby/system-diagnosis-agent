@@ -1,7 +1,28 @@
-# 作品 3 · 系统诊断 Agent
+# 系统诊断 Agent
 
-> 一句话：**把"读日志 / 搜日志 / 查磁盘"这种运维日常，做成一个能自己取证、会声明证据不足、副作用必须人批准的诊断 Agent。**
-> 岗位对口：这是四个 Demo 里最贴嵌入式/Linux 运维日常的一个。
+> **把「读日志 / 搜日志 / 查磁盘」这种运维日常，做成一个能自己取证、会声明证据不足、副作用必须人批准的诊断 Agent。**
+
+[![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](#)
+[![LangGraph](https://img.shields.io/badge/LangGraph-1.x-1C3C3C?logo=langchain&logoColor=white)](#)
+[![MCP](https://img.shields.io/badge/MCP-Model_Context_Protocol-000000)](#)
+[![Tests](https://img.shields.io/badge/tests-420%2B_offline-brightgreen)](#)
+[![CI](https://img.shields.io/badge/CI-18_step_gate-blue)](#)
+[![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
+
+## 项目简介
+
+面向 **Linux 服务器 / 嵌入式板卡** 的运维诊断场景：从真实日志与系统快照取证，经图编排与人机确认，产出**可追溯**的诊断报告。
+
+**设计立场** —— 让程序拿确定性、让模型做归因、让副作用必须人批：健康日志不惊动模型（0 次调用收工），异常才升级到 LLM；任何写操作都停在 `interrupt()` 等人点头。
+
+## 亮点速览
+
+- **程序算确定性、模型做归因** —— 网关判据、工具选择、循环上限、停止条件全在代码里；健康日志 **0 次 LLM 调用**收工
+- **图编排 + 运行时动态并行** —— LangGraph StateGraph，`Send` 扇出 N 路取证，框架 barrier 自动汇总
+- **副作用必须人批准** —— `interrupt()` 让审批发生在流程中段；`SqliteSaver` 支持**跨进程断点续跑**
+- **工具通道可换** —— 同一张图，`--tools direct|mcp` 在「同进程函数调用」与「MCP 协议（7 工具）」之间切换
+- **三层判据评测** —— 黄金集 8 条（含负向断言与失败路径）实测 **9/9**；指纹缓存 + 模型分级使单次调用省 **57%** token
+- **工程化闭环** —— 运行时预算刹车、告警收敛（14 条发现 → 9 个事件）、安全审计（哈希链）、**18 步 CI 门禁（420+ 项测试）**
 
 ---
 
@@ -70,8 +91,8 @@ confirm -. 一个都没批 .-> __end__     ← 人的决定真的能改变走向
 
 | 用途 | 解释器 | 依赖 |
 |---|---|---|
-| **编排**（`day35/36`）| `E:\ai学习\.venv-agent\Scripts\python.exe` | langgraph 1.2.12 / langchain 1.4.2 / langchain-core 1.6.4 / mcp |
-| **工具 + 早期脚本**（`day32/34`、作品 1/2）| `E:\ai学习\.venv\Scripts\python.exe` | mcp 2.2.0 / openai / dotenv（RAG 那套锁 langchain-core 0.3.x）|
+| **编排**（`day35/36`）| `<repo>\.venv-agent\Scripts\python.exe` | langgraph 1.2.12 / langchain 1.4.2 / langchain-core 1.6.4 / mcp |
+| **工具 + 早期脚本**（`day32/34`）| `<repo>\.venv\Scripts\python.exe` | mcp 2.2.0 / openai / dotenv（早期 RAG 实验锁 langchain-core 0.3.x）|
 
 为什么分开：`langgraph 1.x` 要 `langchain-core ≥ 1.0`，而旧环境被 RAG 依赖锁在 `0.3.86`；
 旧 venv 里那个 `langgraph 1.2.11` **装了但 import 不了**。
@@ -80,9 +101,9 @@ confirm -. 一个都没批 .-> __end__     ← 人的决定真的能改变走向
 ## 四、跑法
 
 ```powershell
-cd 'E:\ai学习\.venv\作品3_诊断Agent'
-$py = 'E:\ai学习\.venv-agent\Scripts\python.exe'
-$pyOld = 'E:\ai学习\.venv\Scripts\python.exe'
+cd <repo>                                        # 本仓库根目录
+$py    = '<repo>\.venv-agent\Scripts\python.exe'
+$pyOld = '<repo>\.venv\Scripts\python.exe'
 
 & $py day36_graph_mcp.py --graph                     # 只画图，不花钱
 & $py day36_graph_mcp.py --tools mcp --clean          # 健康日志 → 网关 0 次调用收工
@@ -120,7 +141,7 @@ $pyOld = 'E:\ai学习\.venv\Scripts\python.exe'
 & $py day36_graph_mcp.py --trace-report trace-hitl     # 读 traces/trace-hitl.jsonl 出报告
 ```
 
-实测一份报告（跨进程续跑，全文见 `E:\ai学习\追踪与可观测性笔记_2026-09-22.md`）：
+实测一份报告（跨进程续跑，全文见 `追踪与可观测性笔记_2026-09-22.md`）：
 
 | 项 | 数值 |
 |---|---|
