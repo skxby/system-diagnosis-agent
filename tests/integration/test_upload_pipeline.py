@@ -199,7 +199,7 @@ def test_masked_placeholder_is_consistent_across_lines(service, project, session
     )
     import re
 
-    tokens = set(re.findall(r"\[EMAIL_[0-9a-f]{8}\]", result.masked_text))
+    tokens = set(re.findall(r"\[EMAIL_[0-9a-f]{16}\]", result.masked_text))
     assert len(tokens) == 1, f"同一邮箱产生了多个占位符：{tokens}"
 
 

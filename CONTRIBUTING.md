@@ -10,13 +10,14 @@
 
 ```bash
 git clone https://github.com/skxby/evidencelog && cd evidencelog
-cp .env.example .env          # 至少填 MODEL_PROVIDER_API_KEY 与 SECRET_KEY
+cp .env.example .env          # 设置随机 SECRET_KEY；模型 Key 可选
 docker compose up -d          # 一键起全栈（首次构建 1-3 分钟）
-pytest -q                     # 全量测试（需要一个真实的 PostgreSQL/Redis）
 ```
 
 不想用 Docker 跑应用、只想跑测试：`docker compose up -d postgres redis`，
-再按 README 第 6 节建 `.venv` 装依赖。
+再按 README 第 6 节建 Python 3.13 的 `.venv` 并安装 `requirements.lock.txt`，运行 `pytest -q`。
+全量测试自动创建临时 PostgreSQL 数据库并跑迁移，结束后删除；数据库账号需有建库权限，不向开发库写测试数据。
+无 PG/Redis 时可先运行 `pytest tests/unit`；完整验收必须运行全量测试。
 
 `.env` 里除了 Key，**型号与单价也要照 `.env.example` 留着**（型号名与单价不是密钥）：
 少了它们，成本控制器根本构造不出来，`test_create_run_is_refused_when_budget_is_insufficient`

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from typing import Any
+from datetime import datetime
 
 from sqlalchemy import select
 
@@ -57,7 +58,10 @@ class EventRepository(ProjectScopedRepository[Event]):
         )
 
     def pipeline_events(
-        self, project_id: int, *, limit: int = 50_000
+        self, project_id: int, *, limit: int = 50_000,
+        source_id: int | None = None, time_start: datetime | None = None,
+        time_end: datetime | None = None, filters: dict[str, Any] | None = None,
+        max_event_id: int | None = None,
     ) -> list[dict[str, Any]]:
         """装载喂给分析链路的事件字典 —— **唯一**的 ORM→链路字段映射。
 
@@ -69,9 +73,25 @@ class EventRepository(ProjectScopedRepository[Event]):
         （字段没装载）一个字都不剩。同一条映射抄在两个地方就必然会漂移，
         所以 Worker 与本函数共用它。
         """
-        rows = self.session.execute(
-            self.scoped(project_id).order_by(Event.timestamp, Event.id).limit(limit)
-        ).scalars()
+        query = self.scoped(project_id)
+        if source_id is not None:
+            query = query.where(Event.source_id == source_id)
+        if time_start is not None:
+            query = query.where(Event.timestamp >= time_start)
+        if time_end is not None:
+            query = query.where(Event.timestamp <= time_end)
+        if max_event_id is not None:
+            query = query.where(Event.id <= max_event_id)
+        for key, value in (filters or {}).items():
+            if key in {"severity", "event_type"} and value:
+                query = query.where(getattr(Event, key).in_(value))
+            elif key == "keyword" and value:
+                query = query.where(Event.message.contains(value, autoescape=True))
+        rows = list(self.session.execute(
+            query.order_by(Event.timestamp, Event.id).limit(limit + 1)
+        ).scalars())
+        if len(rows) > limit:
+            raise ValueError(f"分析范围超过 {limit} 条事件，请缩小时间窗；未静默截断")
         return [
             {
                 "event_id": int(row.id),

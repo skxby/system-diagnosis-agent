@@ -10,7 +10,7 @@
 **写入位置是数据卷，不是代码目录**（修订说明第 2 条，最后一句明写
 「不往代码目录写运行时数据」这条不能破）：
 
-    ${DATA_DIR}/knowledge/<domain>/staging/candidates.yaml
+    ${DATA_DIR}/projects/<project_id>/knowledge/<domain>/staging/candidates.yaml
 
 同一 Run 的候选按 `id` 累积去重：重复分析同一份日志不该产生一堆重复候选。
 """
@@ -25,6 +25,7 @@ from typing import Any
 import yaml
 
 from app.analysis.evidence import normalize_evidence_ids
+from app.utils.atomic_files import atomic_write, file_lock, project_data_dir
 
 
 class KnowledgeStagingError(ValueError):
@@ -41,9 +42,10 @@ def candidate_id(domain_id: str, candidate: dict[str, Any]) -> str:
     return f"cand_{hashlib.sha1(key.encode('utf-8')).hexdigest()[:12]}"
 
 
-def staging_path(data_dir: str | Path, domain_id: str) -> Path:
+def staging_path(data_dir: str | Path, domain_id: str, project_id: int | None = None) -> Path:
     """staging 文件路径（数据卷内）。"""
-    return Path(data_dir) / "knowledge" / domain_id / "staging" / "candidates.yaml"
+    base = project_data_dir(data_dir, project_id) if project_id is not None else Path(data_dir)
+    return base / "knowledge" / domain_id / "staging" / "candidates.yaml"
 
 
 def load_candidates(path: Path) -> list[dict[str, Any]]:
@@ -59,18 +61,31 @@ def load_candidates(path: Path) -> list[dict[str, Any]]:
 
 
 def write_candidates(
+    *, data_dir: str | Path, domain_id: str, candidates: list[dict[str, Any]],
+    run_id: int | None = None, project_id: int | None = None,
+    valid_event_ids: set[str] | list[str] | None = None,
+) -> dict[str, Any]:
+    path = staging_path(data_dir, domain_id, project_id)
+    with file_lock(path):
+        return _write_candidates(data_dir=data_dir, domain_id=domain_id,
+                                 candidates=candidates, run_id=run_id,
+                                 project_id=project_id, valid_event_ids=valid_event_ids)
+
+
+def _write_candidates(
     *,
     data_dir: str | Path,
     domain_id: str,
     candidates: list[dict[str, Any]],
     run_id: int | None = None,
+    project_id: int | None = None,
     valid_event_ids: set[str] | list[str] | None = None,
 ) -> dict[str, Any]:
     """把候选写入 staging，按 id 去重后累积。
 
     返回统计：`{"written": n, "skipped": m, "total": k, "path": ...}`
     """
-    path = staging_path(data_dir, domain_id)
+    path = staging_path(data_dir, domain_id, project_id)
     existing = load_candidates(path)
     by_id: dict[str, dict[str, Any]] = {}
     for item in existing:
@@ -117,9 +132,7 @@ def write_candidates(
 
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = [by_id[key] for key in sorted(by_id)]
-    path.write_text(
-        yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8"
-    )
+    atomic_write(path, yaml.safe_dump(payload, allow_unicode=True, sort_keys=False))
 
     return {
         "written": written,

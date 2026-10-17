@@ -54,6 +54,13 @@ class RegisterRequest(StrictModel):
     email: str = Field(min_length=3, max_length=320)
     password: str = Field(min_length=8, max_length=72)
 
+    @field_validator("password")
+    @classmethod
+    def password_bytes(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > 72:
+            raise ValueError("口令 UTF-8 编码不能超过 72 字节")
+        return value
+
 
 class LoginRequest(StrictModel):
     email: str = Field(min_length=3, max_length=320)
@@ -196,6 +203,7 @@ class InsightResponse(StrictModel):
 
 
 class EvidenceResponse(StrictModel):
+    events: list[dict[str, Any]] = Field(default_factory=list)
     id: int
     insight_id: int
     source_id: int | None = None
@@ -234,7 +242,7 @@ class KnowledgeCandidateResponse(StrictModel):
 class EditCandidateRequest(StrictModel):
     """编辑后再确认（计划第 878 行）。只允许改这几项。"""
 
-    title: str | None = Field(default=None, max_length=500)
+    title: str | None = Field(default=None, min_length=1, max_length=500)
     description: str | None = Field(default=None, max_length=2000)
     match: dict[str, Any] | None = None
     severity_hint: Literal["high", "medium", "low"] | None = None

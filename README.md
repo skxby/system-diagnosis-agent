@@ -24,6 +24,9 @@ V1 是个人全栈、单领域、**只读**的日志分析 Runtime：上传日�
 | `AGENTS.md` | 要给这个仓库提交改动：10 条硬约束与验收口径 |
 | `CONTRIBUTING.md` / `CODE_OF_CONDUCT.md` | 想参与：怎么跑、提交前自检什么、讨论的规矩 |
 | `SECURITY.md` | 要报安全类问题，或想知道"哪些数据会离开本机 / 会发给模型供应商" |
+| `docs/ui-guide.md` / `docs/api.md` | 网页流程与接口约定 |
+| `docs/architecture.md` / `docs/limitations.md` | 当前接线、数据边界与尚未实现能力 |
+| `docs/runbook.md` / `docs/audit-2026-10-17.md` | 运维处置、审计核实与验证证据 |
 | `.dsh/skills/*/SKILL.md` | 要按既有节奏做加表、验收、提交、成本核算等固定动作 |
 
 > 代码与测试里大量出现「计划第 N 行」这类引用（`tests/datasets/*/expect.json`
@@ -55,7 +58,7 @@ V1 是个人全栈、单领域、**只读**的日志分析 Runtime：上传日�
 
 - **不装 Python 也行的路** —— 页面上三步：① 注册一个账号 → ② 新建项目 →
   ③ 在项目页上传一份真语料（用仓库里的 `logs/Mac_2k.log` 就行，2000 行真实系统日志）
-  → 点「发起分析」，等 20 秒左右就能看到带证据的结论。
+  → 点「开始分析」，从状态页进入报告。L0 显示规则统计；需要模型的分支取决于模型配置与服务可用性。
 - **想一条命令备好**（需要宿主 Python，见第 6 节建 `.venv`）：
 
 ```powershell
@@ -63,8 +66,7 @@ V1 是个人全栈、单领域、**只读**的日志分析 Runtime：上传日�
 ```
 
 这条命令建出来的演示账号是 **`demo@evidencelog.local` / `evidencelog-demo-2026`**
-（只在你自己这台机器的数据库里，换个环境就不存在；想用自己的账号直接在页面上注册，
-口令 8–72 位即可）。
+（只在本机数据库内；首次初始化可注册账号，后续注册默认关闭。口令至少 8 个字符，UTF-8 编码不超过 72 字节）。
 
 下面是手工版（Linux / macOS / 想自己控制每一步时用）：
 
@@ -76,14 +78,16 @@ cd <仓库目录>
 cp .env.example .env
 ```
 
-打开 `.env`，**至少填这两项**：
+打开 `.env`，设置随机会话密钥；需要模型时再填写真实 API Key：
 
 ```dotenv
 MODEL_PROVIDER_API_KEY=sk-你的真实Key
 SECRET_KEY=换成一串你自己的随机值
 ```
 
-其余项都有可用默认值（模型映射、单价、预算、时区）。
+SECRET_KEY 必须为至少 32 字符的随机值；Windows 启动脚本会自动生成。
+模型名称、推理档位和价格由 `.env.example` 提供示例，代码默认名称为空、价格为 0；付费分析必须按供应商实际配置。
+未配置任何有效模型凭据时，Web 仍可启动，L0 正常完成；需要模型的分析会明确失败并保留规则报告。
 **`.env` 已被 `.gitignore` 与 `.dockerignore` 双双挡住 —— 不会进 Git，也不会进镜像。**
 
 ```bash
@@ -91,7 +95,7 @@ SECRET_KEY=换成一串你自己的随机值
 docker compose up -d
 
 # ③ 确认都健康
-docker compose ps
+docker compose ps -a
 ```
 
 期望看到：
@@ -122,10 +126,10 @@ logagent-beat       Up
    > 边界提示：**Web access 平文日志不属本领域**（那是"站点访问"语义，不是"主机/进程监控"），
    > 整批会计入坏行 —— 这是有意为之，负样本见 `logs/nginx_plain.log` 与 `logs/README.md`。
    > 要让它能解析得**加一个领域**（新目录包 + 注册一行），而不是放宽现有 parser。
-4. **发起分析** —— 选数据源，可留空时间范围。API **立即返回** `run_id + queued`。
+4. **发起分析** —— 选数据源，可留空时间范围。API **立即返回** `run_id + status`，正常为 queued。时间窗、来源、严重度、类型和关键词均在 SQL 筛选阶段生效。派发失败会显示 timeout / dispatch_failed。
 5. **看状态** —— 状态页每 3 秒刷新，显示阶段进度、token、成本、心跳。
 6. **看报告** —— 结论按四层语义着色：
-   - `✓ 确认`（fact）：**证据可展开逐条核对**，点开能看到关联事件 id
+   - `✓ 确认`（fact）：**证据可展开逐条核对**，点开能看到关联事件 id、时间和脱敏后的内容
    - `→ 推测`（inference）：附推理过程
    - `? 可能`（possibility）：附局限说明
    - `− 未知`（unknown）：附信息缺口
@@ -146,18 +150,24 @@ logagent-beat       Up
 
 ---
 
+项目页的「分析记录」可回到历史状态和报告，支持直接收藏 Run 链接。
+「事件分组与事故记忆库」提供归并结果与事件下钻；事故不代表根因。
+
 ## 4. 环境变量说明
 
 完整清单见 `.env.example`。关键项：
 
-| 变量 | 默认 | 说明 |
+| 变量 | 模板值 / 运行约定 | 说明 |
 |---|---|---|
 | `DATABASE_URL` | `...@127.0.0.1:5432/logagent` | 宿主机直跑用。**compose 里会被覆盖成 `@postgres:5432`** |
 | `REDIS_URL` | `redis://127.0.0.1:6379/0` | 同上，compose 里覆盖成 `@redis:6379` |
 | `POSTGRES_PASSWORD` | `logagent_dev_pw` | compose 与 `DATABASE_URL` 共用；换它要一起换 |
-| `SECRET_KEY` | `change-me` | JWT 签名密钥，**必须换**；空值会让鉴权失效 |
+| `SECRET_KEY` | 空；启动脚本生成随机值 | Web 启动拒绝空值、公开占位符和不足 32 字符的密钥 |
+| `ALLOW_REGISTRATION` | `false` | 只允许空库首次初始化注册；显式开启后允许其他账号注册 |
+| `COOKIE_SECURE` | `false`（本机 HTTP） | HTTPS 部署设置 true |
+| `DEFAULT_DOMAIN_ID` | `computer_monitoring` | Registry 中的默认领域，业务代码不写死名称 |
 | `MODEL_PROVIDER_BASE_URL` | `https://api.deepseek.com` | OpenAI 兼容端点 |
-| `MODEL_PROVIDER_API_KEY` | 空 | 供应商密钥。**留空则模型分析降级为纯规则报告** |
+| `MODEL_PROVIDER_API_KEY` | 空 | 供应商密钥。留空会继续查找别名环境变量和 DSH 凭据；都找不到时需要模型的分支失败并保留规则报告 |
 | `MODEL_L1/L2/L3` | `deepseek-flash` | 等级 → 型号映射。**型号只出现在这里**，业务代码只认 L1–L3 |
 | `MODEL_L*_REASONING` | `off` / `low` / `high` | 合法值只有 `off`/`low`/`high`/`max`；`medium` 是非法值 |
 | `MODEL_L*_PRICE_*_PER_1M` | `1` / `4` | 单价，**元 / 每百万 token**；用于成本核算 |
@@ -170,9 +180,9 @@ logagent-beat       Up
 
 ### 密钥放哪
 
-优先级：**`.env` 的 `MODEL_PROVIDER_API_KEY` > 环境变量 > `$DSH_HOME/.credentials.yaml`**。
+优先级：**显式传入 > Settings（环境变量优先于 `.env`）> 别名环境变量 > `$DSH_HOME/.credentials.yaml`**。
 第三条是为了复用已在 DeepSeek Harness 里配好的 Key，避免同一把 Key 存两份。
-都找不到时会**启动即报错并说明去哪里配**，不会等到第一次调用才含糊地失败。
+凭据仅在真正调用模型时解析；L0 不初始化网关。认证/参数错误不重试并明确失败，网络故障可重试后降级为 partial_success。两种情况均保留规则报告。
 
 ---
 
@@ -187,7 +197,7 @@ docker compose logs -f worker
 docker compose up -d --build web worker
 
 # 手动跑迁移
-docker compose run --rm migrate
+docker compose up migrate
 
 # 进数据库看一眼
 docker compose exec postgres psql -U logagent -d logagent -c '\dt'
@@ -208,8 +218,8 @@ docker compose down -v
 docker compose up -d postgres redis
 
 python -m venv .venv
-.venv/Scripts/python.exe -m pip install -r requirements.txt      # Windows
-# source .venv/bin/activate && pip install -r requirements.txt    # macOS / Linux
+.venv/Scripts/python.exe -m pip install -r requirements.lock.txt      # Windows
+# source .venv/bin/activate && pip install -r requirements.lock.txt    # macOS / Linux
 
 alembic upgrade head
 pytest -q                                          # 单测 + 集成测试
@@ -275,7 +285,7 @@ RUN_LIVE_MODEL_TESTS=1 pytest tests/integration/test_gateway_live.py -v -s
 
 ```text
 解析率   域内 5 份系统日志 10000/10000 = 100%；含负样本 nginx_plain 11500/12500 = 92.00%
-脱敏     替换 12268 次；11575 个排障字段（uid=/pid=/HTTP 状态码/请求路径/容器 ID）零误伤
+脱敏     parser_eval(mask_ip=True) 替换 12268 次；11575 个排障字段（uid=/pid=/HTTP 状态码/请求路径/容器 ID）零误伤；Web 默认 mask_ip=False，可勾选开启
 Golden   离线 18/18 断言 ¥0
 E2E      容器全栈 16/16；真实调用 1607/3058 tokens、¥0.0138、7 条结论
 真机分析 真实语料 Mac_2k 2000 事件 → 15 结论 15 证据、1848 个事件分组、593 条事故

@@ -15,8 +15,8 @@
      所以被杀时库里留下的是 `running` + 未过期的心跳 —— 这正是
      `find_zombie_runs` 认的条件；
   ③ 超过心跳阈值后，beat 上的回收任务把它收成 `timeout`。
-     停在 `queued`（任务从未被取走）的 Run 没有时间基准可判（冻结表里
-     AgentRun 没有 created_at），这一条**已知且刻意不猜**：靠 ① 的重投递兜底。
+     新 queued Run 的排队基准记录在 run_metadata.queued_at，由同一维护任务回收；
+     旧记录缺少该基准时不补造时间。
 """
 
 from celery import Celery

@@ -5,7 +5,7 @@ API 只做验证、鉴权、创建任务、返回状态，**不承担分析逻�
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Response, status
+from fastapi import APIRouter, HTTPException, Response, Request, status
 
 from app.api.deps import CurrentUser, ProjectScopeDep, SessionDep
 from app.api.schemas import (
@@ -25,8 +25,10 @@ from app.models.user import User
 from app.repositories.datasource import DataSourceRepository
 from app.repositories.project import ProjectRepository
 from app.repositories.user import UserRepository
+from sqlalchemy import select, text
 
 router = APIRouter()
+_DUMMY_PASSWORD_HASH = hash_password("nonexistent-account-timing-guard")
 
 
 # ============================================================
@@ -38,6 +40,10 @@ router = APIRouter()
 def register(payload: RegisterRequest, session: SessionDep) -> TokenResponse:
     """注册（自用场景可省略注册页，但端点保留以便初始化账号）。"""
     users = UserRepository(session)
+    if not get_settings().allow_registration:
+        session.execute(text("SELECT pg_advisory_xact_lock(83726105)"))
+        if session.scalar(select(User.id).limit(1)) is not None:
+            raise HTTPException(status_code=403, detail="注册已关闭；仅首次初始化允许创建账号")
     if users.get_by_email(payload.email) is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="该邮箱已注册"
@@ -50,12 +56,20 @@ def register(payload: RegisterRequest, session: SessionDep) -> TokenResponse:
 
 @router.post("/api/login", response_model=TokenResponse, tags=["auth"])
 def login(
-    payload: LoginRequest, session: SessionDep, response: Response
+    payload: LoginRequest, session: SessionDep, response: Response, request: Request
 ) -> TokenResponse:
     """登录：返回 JWT，同时写入 `httpOnly` Cookie（计划第 858 行）。"""
+    from app.services.login_guard import check_login_attempt, LoginRateLimitError, LoginGuardUnavailable
+    try:
+        check_login_attempt(payload.email, request.client.host if request.client else "unknown")
+    except LoginRateLimitError as exc:
+        raise HTTPException(429, str(exc), headers={"Retry-After": "300"}) from exc
+    except LoginGuardUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
     user = UserRepository(session).get_by_email(payload.email)
     # 刻意不区分"用户不存在"与"口令不对"，避免枚举账号
-    if user is None or not verify_password(payload.password, user.password_hash):
+    valid = verify_password(payload.password, user.password_hash if user else _DUMMY_PASSWORD_HASH)
+    if user is None or not valid:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="邮箱或口令不正确",
@@ -68,10 +82,17 @@ def login(
         value=token,
         httponly=True,           # 计划要求：token 存 httpOnly Cookie
         samesite="lax",
-        secure=False,            # 本机 http 自用；上线需置 True 并配 HTTPS
+        secure=get_settings().cookie_secure,
         max_age=60 * 60 * 24 * 7,
     )
     return TokenResponse(access_token=token)
+
+
+@router.post("/api/logout", tags=["auth"])
+def logout(response: Response) -> dict:
+    response.delete_cookie("access_token", path="/", secure=get_settings().cookie_secure,
+                           httponly=True, samesite="lax")
+    return {"status": "logged_out"}
 
 
 @router.get("/api/me", tags=["auth"])

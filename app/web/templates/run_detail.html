@@ -49,7 +49,7 @@
 {% block scripts %}
 <script>
 const RUN_ID = {{ run_id }};
-const PROJECT_ID = "{{ project_id }}";
+let PROJECT_ID = {{ project_id | tojson }};
 
 function table(headers, rows) {
   if (!rows.length) return el('div', { class: 'empty', text: '（无）' });
@@ -160,6 +160,13 @@ async function load() {
   }
 }
 
-load();
+async function initialize() {
+  try {
+    const run = await API.get(`/api/runs/${RUN_ID}`);
+    PROJECT_ID = run.project_id;
+    await load();
+  } catch (error) { showError(`加载 Run 失败：${error.message}`); }
+}
+initialize();
 </script>
 {% endblock %}

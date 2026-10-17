@@ -187,7 +187,7 @@ domains/computer_monitoring/
 
 | 用途 | 选型 | 个人全栈理由 |
 |---|---|---|
-| 语言 / Web | Python 3.11+、FastAPI | 异步、自带接口文档、生态全 |
+| 语言 / Web | Python 3.13、FastAPI | 异步、自带接口文档、生态全 |
 | ORM / 迁移 | SQLAlchemy 2.0（`Mapped` + `select()`）、Alembic | 用 2.0 原生写法，不混用 Flask 风格 API |
 | 数据库 | PostgreSQL 15+ | 事务可靠，Event.payload 用 JSONB |
 | 异步队列 | Redis 7 + Celery | 重试 / 超时 / 崩溃恢复白送，比自己写后台任务省心 |
@@ -291,7 +291,7 @@ MODEL_L2_PRICE_INPUT_PER_1M=
 MODEL_L2_PRICE_OUTPUT_PER_1M=
 MODEL_L3_PRICE_INPUT_PER_1M=
 MODEL_L3_PRICE_OUTPUT_PER_1M=
-# 预算（货币单位自定，建议先用美元）
+# 预算（货币单位统一为人民币元）
 MONTHLY_BUDGET=10
 DEFAULT_RUN_MAX_COST=0.30
 # 时间戳缺时区时的默认时区

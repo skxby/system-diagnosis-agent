@@ -5,9 +5,10 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}日志分析{% endblock %} · Log Intelligence Agent</title>
-  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/app.css?v={{ asset_version }}">
 </head>
 <body>
+  <a class="skip-link" href="#main-content">跳到主要内容</a>
   <header class="topbar">
     <a class="brand" href="/projects">Log Intelligence Agent</a>
     <nav class="nav">
@@ -16,12 +17,12 @@
     </nav>
   </header>
 
-  <main class="container">
-    <div id="page-error" class="banner banner-error" hidden></div>
+  <main class="container" id="main-content">
+    <div id="page-error" class="banner banner-error" role="alert" hidden></div>
     {% block content %}{% endblock %}
   </main>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v={{ asset_version }}"></script>
   {% block scripts %}{% endblock %}
 </body>
 </html>

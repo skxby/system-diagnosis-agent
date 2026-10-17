@@ -13,7 +13,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.models import enums
 from app.models.agent_run import AgentRun
@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 
 class AgentRunRepository(ProjectScopedRepository[AgentRun]):
     model = AgentRun
+
+    def lock_idempotency_key(self, key: str) -> None:
+        self.session.execute(text("SELECT pg_advisory_xact_lock(:key)"),
+                             {"key": int(key[:15], 16)})
 
     # ---------- 创建与幂等 ----------
 
@@ -48,20 +52,22 @@ class AgentRunRepository(ProjectScopedRepository[AgentRun]):
             input=run_input,
             parent_run_id=parent_run_id,
             status=enums.AGENT_RUN_QUEUED,
+            run_metadata={"queued_at": datetime.now(timezone.utc).isoformat()},
         )
         return self.add(project_id, run)
 
     def find_reusable(self, project_id: int, idempotency_key: str) -> AgentRun | None:
         """找可复用的成功 Run（计划第 703 行：不重复执行、不重复计费）。
 
-        只有 `completed` 才算可复用：`partial_success` 的结果本身不完整，
-        拿它当"已有结果"会把不完整当成完整交付。
+        completed 复用结果；queued/running 复用正在处理的任务，避免双击重复计费。
+        partial_success 不作为完整结果复用。
         """
         return self.session.execute(
             self.scoped(project_id)
             .where(
                 AgentRun.idempotency_key == idempotency_key,
-                AgentRun.status == enums.AGENT_RUN_COMPLETED,
+                AgentRun.status.in_([enums.AGENT_RUN_COMPLETED, enums.AGENT_RUN_QUEUED,
+                                     enums.AGENT_RUN_RUNNING]),
             )
             .order_by(AgentRun.id.desc())
             .limit(1)
@@ -122,7 +128,7 @@ class AgentRunRepository(ProjectScopedRepository[AgentRun]):
         now: datetime | None = None,
         project_id: int | None = None,
     ) -> list[AgentRun]:
-        """找出心跳超时、仍是 `running` 的 Run（计划第 706 行）。
+        """找出运行心跳或新任务排队时间超时的 Run（计划第 706 行）。
 
         `project_id=None` 表示跨项目扫描 —— 这是**为运维/Beat 任务准备的**，
         正常业务路径应传 project_id 保持隔离。
@@ -131,10 +137,12 @@ class AgentRunRepository(ProjectScopedRepository[AgentRun]):
         deadline = reference_time - timedelta(seconds=timeout_seconds)
 
         statement = select(AgentRun).where(
-            AgentRun.status == enums.AGENT_RUN_RUNNING,
+            AgentRun.status.in_([enums.AGENT_RUN_RUNNING, enums.AGENT_RUN_QUEUED]),
             # 心跳与开始时间都早于截止时刻（心跳为空则看开始时间）
             (AgentRun.last_heartbeat < deadline)
-            | (AgentRun.last_heartbeat.is_(None) & (AgentRun.started_at < deadline)),
+            | (AgentRun.last_heartbeat.is_(None) & (AgentRun.started_at < deadline))
+            | ((AgentRun.status == enums.AGENT_RUN_QUEUED)
+               & (AgentRun.run_metadata["queued_at"].astext < deadline.isoformat())),
         )
         if project_id is not None:
             statement = statement.where(AgentRun.project_id == project_id)
@@ -154,32 +162,35 @@ class AgentRunRepository(ProjectScopedRepository[AgentRun]):
         必须经状态机判定，不能直接赋值 status —— 否则"终态不可再改"这条
         就没有机制保障了。
         """
-        from app.analysis.state_machine import StateMachine
+        from app.analysis.state_machine import IllegalTransitionError
 
+        self.session.flush()
         reclaimed: list[int] = []
-        for run in self.find_zombie_runs(
-            timeout_seconds=timeout_seconds, now=now, project_id=project_id
-        ):
-            machine = StateMachine(
-                status=run.status,
-                current_phase=run.current_phase,
-                phase_history=run.phase_history,
-            )
-            try:
-                machine.transition(enums.AGENT_RUN_TIMEOUT, reason="heartbeat_lost")
-            except Exception:  # noqa: BLE001 - 非法转移说明状态已被别处改过
-                # 刻意跳过这一条而不是中断整轮回收：一条坏数据不该让其余僵尸
-                # Run 都收不回来。但也**不静默**，记一条 warning 留下痕迹。
-                logger.warning("跳过无法转移的 Run %s（当前 %s）", run.id, run.status)
+        deadline = (now or datetime.now(timezone.utc)) - timedelta(seconds=timeout_seconds)
+        for candidate in self.find_zombie_runs(timeout_seconds=timeout_seconds, now=now, project_id=project_id):
+            run = self.session.execute(self.scoped(candidate.project_id)
+                .where(AgentRun.id == candidate.id).with_for_update()
+                .execution_options(populate_existing=True)).scalar_one()
+            if run.status not in {enums.AGENT_RUN_RUNNING, enums.AGENT_RUN_QUEUED}:
                 continue
-            run.status = machine.status
-            run.phase_history = machine.phase_history
+            heartbeat = run.last_heartbeat or run.started_at
+            if heartbeat is None:
+                try:
+                    heartbeat = datetime.fromisoformat((run.run_metadata or {})["queued_at"])
+                except (KeyError, ValueError, TypeError):
+                    logger.warning("Run %s 缺少可解析的排队时间，无法自动判定超时", run.id)
+                    continue
+            if heartbeat >= deadline:
+                continue  # 锁前看到的旧心跳已被另一个进程更新
+            try:
+                note = ("排队超时，Run 已被回收为 timeout" if run.status == enums.AGENT_RUN_QUEUED
+                        else "Worker 心跳丢失，Run 已被回收为 timeout")
+                self.apply_status(run.project_id, run.id, target=enums.AGENT_RUN_TIMEOUT,
+                    reason="heartbeat_lost", error=run.error or "heartbeat lost",
+                    metadata={"stop_reason": "timeout", "note": note})
+            except IllegalTransitionError:
+                continue
             run.finished_at = now or datetime.now(timezone.utc)
-            metadata = dict(run.run_metadata or {})
-            metadata["stop_reason"] = "timeout"
-            metadata["note"] = "Worker 心跳丢失，Run 已被回收为 timeout"
-            run.run_metadata = metadata
-            run.error = run.error or "heartbeat lost"
             reclaimed.append(int(run.id))
         return reclaimed
 
@@ -271,7 +282,9 @@ class AgentRunRepository(ProjectScopedRepository[AgentRun]):
         """经状态机写入新状态。非法转移会抛错，不静默改。"""
         from app.analysis.state_machine import StateMachine
 
-        run = self.get(project_id, run_id)
+        self.session.flush()
+        run = self.session.execute(self.scoped(project_id).where(AgentRun.id == run_id)
+            .with_for_update().execution_options(populate_existing=True)).scalar_one_or_none()
         if run is None:
             return False
 

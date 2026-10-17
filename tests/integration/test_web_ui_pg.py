@@ -79,7 +79,7 @@ def _project(client: TestClient, headers: dict) -> int:
 
 @pytest.mark.parametrize(
     "path",
-    ["/login", "/projects", "/projects/1", "/runs/1", "/report/1", "/knowledge/1"],
+    ["/login", "/projects", "/projects/1", "/runs/1", "/runs/1/detail", "/report/1", "/knowledge/1"],
 )
 def test_pages_render(client: TestClient, path: str):
     response = client.get(path)

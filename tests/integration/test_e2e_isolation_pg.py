@@ -521,7 +521,7 @@ def test_knowledge_closed_loop_over_http(client: TestClient, work_tmp):
                 "description": "同一进程反复被 oom-killer 杀死",
                 "evidence_ids": ["1"], "confidence": 0.7,
             }],
-            run_id=1, valid_event_ids={"1"},
+            run_id=1, project_id=project_id, valid_event_ids={"1"},
         )
         assert stats["written"] == 1
 
@@ -585,7 +585,7 @@ def test_false_positive_marks_suppression_bucket(client: TestClient, work_tmp):
             data_dir=data_dir, domain_id="computer_monitoring",
             candidates=[{"kind": "error_pattern", "title": "其实是正常抖动",
                          "evidence_ids": ["1"], "confidence": 0.6}],
-            run_id=1, valid_event_ids={"1"},
+            run_id=1, project_id=project_id, valid_event_ids={"1"},
         )
         candidate_id = client.get(
             f"/api/projects/{project_id}/knowledge/candidates", headers=headers
@@ -605,7 +605,7 @@ def test_false_positive_marks_suppression_bucket(client: TestClient, work_tmp):
         assert entry["kind"] == "false_positive", "误报必须以 false_positive 类型生效"
 
         # 归档留痕，便于事后复查
-        archive = data_dir / "knowledge" / "computer_monitoring" / "false_positives"
+        archive = data_dir / "projects" / str(project_id) / "knowledge" / "computer_monitoring" / "false_positives"
         assert archive.is_dir() and list(archive.glob("*.yaml"))
     finally:
         get_settings().data_dir = original

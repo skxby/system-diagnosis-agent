@@ -34,6 +34,7 @@ from app.analysis.idempotency import (
     NonRetryableError,
     classify_error,
     make_idempotency_key,
+    PIPELINE_VERSION,
 )
 from app.analysis.retry import RetryPolicy, call_with_fallback
 from app.analysis.state_machine import IllegalTransitionError, StateMachine
@@ -77,6 +78,8 @@ class RunRequest:
             filters=self.filters,
             domain_id=self.domain_id,
             domain_version=self.domain_version,
+            pipeline_version=f"{PIPELINE_VERSION}:source:{self.run_input['source_revision']}"
+                if self.run_input and "source_revision" in self.run_input else PIPELINE_VERSION,
         )
 
 
@@ -129,6 +132,8 @@ def create_run(
     正是"接口留好了、但没人接上"的那一类。
     """
     key = request.idempotency_key()
+    if hasattr(run_repository, "lock_idempotency_key"):
+        run_repository.lock_idempotency_key(key)
 
     reusable = run_repository.find_reusable(request.project_id, key)
     if reusable is not None:
@@ -138,7 +143,11 @@ def create_run(
         request.project_id,
         source_id=request.source_id,
         idempotency_key=key,
-        run_input=request.run_input,
+        run_input={**(request.run_input or {}), "domain_id": request.domain_id,
+                   "domain_version": request.domain_version,
+                   "time_range": {"start": request.time_start.isoformat(),
+                                  "end": request.time_end.isoformat()},
+                   "filters": request.filters, "start_tier": request.start_tier},
         parent_run_id=parent_run_id,
     )
     # 必须 flush 才能拿到自增 id —— 计划第 731 行要求"立即返回 run_id"，

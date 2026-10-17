@@ -224,6 +224,7 @@ def persist_insights(
     source_id: int | None = None,
     incident_id_by_title: dict[str, int] | None = None,
     incident_by_event: dict[str, int] | None = None,
+    timestamps_by_event: dict[str, Any] | None = None,
 ) -> PersistenceResult:
     """把校验后的 Insight 与其 Evidence 写入数据库。
 
@@ -281,12 +282,14 @@ def persist_insights(
         result.insight_ids.append(int(insight.id))
 
         if evidence_ids:
+            timestamps = [timestamps_by_event[e] for e in evidence_ids
+                          if timestamps_by_event and e in timestamps_by_event]
             evidence = Evidence(
                 insight_id=insight.id,
                 source_id=source_id,
                 event_ids=evidence_ids,
-                time_range=None,
-                calculation=None,
+                time_range={"start": min(timestamps).isoformat(), "end": max(timestamps).isoformat()} if timestamps else None,
+                calculation=f"直接引用 {len(evidence_ids)} 条已校验事件；不构成根因证明",
                 description=f"支撑「{item.title}」的事件",
             )
             evidence_repository.add(project_id, evidence)

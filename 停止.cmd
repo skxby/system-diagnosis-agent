@@ -8,7 +8,7 @@ cd /d "%~dp0"
 
 echo.
 echo   Stopping EvidenceLog containers (data volumes are kept)...
-docker compose down
+docker compose down --remove-orphans
 echo.
 echo   Done. Start again with 启动.cmd
 echo.

@@ -5,7 +5,7 @@ r"""脱敏（红线 5：脱敏必须发生在落盘之前）。
 覆盖：
 - 邮箱
 - 信用卡（**Luhn 校验通过才替换**）
-- 电话号码（仅带分隔符或国际前缀的形态，避免吃掉普通数字）
+- 电话号码（大陆手机号及带分隔符、国际前缀的形态；JSON 数字计数器保留）
 - 明确前缀的密钥：`sk-…` / `ghp_…` / `AKIA…` / `xoxb-…` 等
 - IP 地址（**可配置开关**：内网排障常需要它，默认关闭）
 
@@ -20,12 +20,13 @@ r"""脱敏（红线 5：脱敏必须发生在落盘之前）。
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-#: 占位符里的哈希长度，与计划示例 `[EMAIL_a1b2c3d4]` 一致
-HASH_LEN = 8
+#: 占位符使用 64 bit 哈希；旧的 8 hex 占位符不重写。
+HASH_LEN = 16
 
 #: 默认盐。单用户场景用固定盐即可让占位符「全局一致」（计划第 553 行）。
 #: 换盐会使历史占位符与新占位符不再对应，故不要随意改。
@@ -96,6 +97,12 @@ PHONE_RE = re.compile(
     r"|(?<![\d\-])(?:\(\d{2,4}\)[ ]?\d{3,4}[ \-]\d{3,4})"
     r"(?![\d\-])"
 )
+MOBILE_RE = re.compile(r"(?<![A-Za-z0-9_])1[3-9]\d{9}(?![A-Za-z0-9_])")
+IDENTITY_RE = re.compile(r"(?<![A-Za-z0-9_])[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?![A-Za-z0-9_])")
+BEARER_RE = re.compile(r"(?i)(\bbearer\s+)([A-Za-z0-9._~+/=-]+)")
+URL_PASSWORD_RE = re.compile(r"(\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\s/:@]+:)([^\s/@]+)(?=@)")
+JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b")
+PRIVATE_KEY_RE = re.compile(r"-----BEGIN ([A-Z ]*PRIVATE KEY)-----.*?-----END \1-----", re.DOTALL)
 
 #: 明确前缀的密钥（计划第 548 行）。前缀本身就是强信号，无需额外校验。
 SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -166,7 +173,11 @@ class MaskStats:
 
 def build_rules(*, mask_ip: bool) -> tuple[MaskRule, ...]:
     rules: list[MaskRule] = [
+        MaskRule("private_key_block", PRIVATE_KEY_RE, "SECRET"),
+        MaskRule("jwt", JWT_RE, "SECRET"),
+        MaskRule("identity", IDENTITY_RE, "IDENTITY"),
         MaskRule("email", EMAIL_RE, "EMAIL", normalize=normalize_email),
+        MaskRule("mobile", MOBILE_RE, "PHONE", normalize=normalize_digits),
         MaskRule("card", CARD_RE, "CARD", validator=luhn_ok, normalize=normalize_digits),
         MaskRule("phone", PHONE_RE, "PHONE", normalize=normalize_digits),
     ]
@@ -198,9 +209,50 @@ class Masker:
         return f"[{kind}_{hash_token(raw, salt=self.salt)}]"
 
     def mask(self, text: str) -> str:
+        """结构化输入按字段脱敏，保留数字计数器与合法 JSON 语法。"""
+        if not self.enabled or not text:
+            return text
+        if text.lstrip().startswith(("{", "[")):
+            try:
+                raw = json.loads(text)
+            except (ValueError, TypeError):
+                lines = text.splitlines(keepends=True)
+                if len(lines) > 1 and all(not line.strip() or line.lstrip().startswith("{") for line in lines):
+                    return "".join(self.mask(line.rstrip("\r\n")) + ("\n" if line.endswith("\n") else "") for line in lines)
+            else:
+                masked = self._mask_json(raw)
+                return json.dumps(masked, ensure_ascii=False) if masked != raw else text
+        return self._mask_text(text)
+
+    def _mask_json(self, value, key: str = ""):
+        if isinstance(value, dict):
+            return {self._mask_text(str(k)): self._mask_json(v, str(k)) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._mask_json(item, key) for item in value]
+        if key.lower() in {"phone", "mobile", "phone_number", "mobile_number", "id_card", "identity_number",
+                           "card", "card_number", "credit_card", "card_no", "id_number", "identity_card",
+                           "手机号", "手机号码", "电话号码", "身份证", "身份证号", "银行卡", "银行卡号",
+                           "password", "passwd", "pwd", "secret", "token", "api_key", "apikey"} and value is not None:
+            raw = str(value)
+            if re.fullmatch(r"\[[A-Z]+_[0-9a-f]+\]", raw):
+                return value
+            self.stats.record("structured_sensitive")
+            return self.token_for("SECRET", raw)
+        return self._mask_text(value) if isinstance(value, str) else value
+
+    def _mask_text(self, text: str) -> str:
         """脱敏一段文本。`enabled=False` 时原样返回。"""
         if not self.enabled or not text:
             return text
+
+        def secret_value(match: re.Match[str]) -> str:
+            if re.fullmatch(r"\[SECRET_[0-9a-f]+\]", match.group(2)):
+                return match.group(0)
+            self.stats.record("secret_credential")
+            return match.group(1) + self.token_for("SECRET", match.group(2))
+
+        text = BEARER_RE.sub(secret_value, text)
+        text = URL_PASSWORD_RE.sub(secret_value, text)
 
         # IP 规则刻意排在最后（见 _apply 之后的注释），故此处跳过它
         for rule in self._rules:

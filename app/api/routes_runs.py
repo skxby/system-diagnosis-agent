@@ -57,13 +57,14 @@ def _uploads_dir() -> Path:
     response_model=UploadResponse,
     tags=["upload"],
 )
-async def upload_log(
+def upload_log(
     scope: ProjectScopeDep,
     session: SessionDep,
     # FastAPI 的文件上传就必须写成 File(...) 默认值，这是框架约定写法
     file: UploadFile = File(...),  # noqa: B008
     fmt: str = Form(...),
     data_source_id: int | None = Form(default=None),
+    mask_ip: bool = Form(default=False),
 ) -> UploadResponse:
     """上传日志：脱敏 → 落盘 → 解析 → 入库（阶段 04 的管道）。
 
@@ -75,7 +76,8 @@ async def upload_log(
             detail=f"不支持的格式 {fmt!r}；V1 只支持 txt 与 jsonl",
         )
 
-    content = await file.read()
+    from app.services.upload_service import MAX_UPLOAD_BYTES
+    content = file.file.read(MAX_UPLOAD_BYTES + 1)
 
     service = UploadService(session, uploads_dir=_uploads_dir())
     try:
@@ -85,6 +87,7 @@ async def upload_log(
             filename=file.filename or "upload.log",
             fmt=fmt,
             data_source_id=data_source_id,
+            mask_ip=mask_ip,
         )
     except UploadTooLargeError as exc:
         # 超限明确拒绝（阶段 04 验收第 5 条），不是悄悄截断
@@ -131,15 +134,19 @@ def create_analysis_run(
         )
 
     domain = _load_domain()
-    now = datetime.now(timezone.utc)
     start = (
         payload.time_range.start
         if payload.time_range and payload.time_range.start
         else _epoch()
     )
-    end = (
-        payload.time_range.end if payload.time_range and payload.time_range.end else now
-    )
+    from sqlalchemy import func, select
+    from app.models.event import Event
+    latest, revision = session.execute(select(func.max(Event.timestamp), func.max(Event.id)).where(
+        Event.project_id == scope.project_id, Event.source_id == source.id)).one()
+    end = (payload.time_range.end if payload.time_range and payload.time_range.end
+           else latest or _epoch())
+    if start > end:
+        raise HTTPException(status_code=HTTP_422, detail="起始时间不能晚于结束时间")
 
     filters = payload.filters.model_dump(exclude_none=True) if payload.filters else {}
 
@@ -154,7 +161,7 @@ def create_analysis_run(
     project_row = session.get(Project, scope.project_id)
     controller = build_cost_controller(project=project_row, session=session)
     if controller is not None:
-        pre = controller.pre_check(payload.start_tier or "L2")
+        pre = controller.pre_check(payload.start_tier or "L3")
         if not pre.allowed:
             # 402 而不是 422：这不是"参数写错了"，是"钱不够"。
             # 用 402 让调用方一眼分清该改参数还是该加预算。
@@ -170,6 +177,9 @@ def create_analysis_run(
     # 即"重试入口存在但对最常见的发起方式不可用"。
     run_input = payload.model_dump(mode="json")
     run_input["time_range"] = {"start": start.isoformat(), "end": end.isoformat()}
+    run_input["domain_id"] = domain.domain_id
+    run_input["domain_version"] = domain.version
+    run_input["source_revision"] = int(revision or 0)
 
     request = RunRequest(
         project_id=scope.project_id,
@@ -179,7 +189,7 @@ def create_analysis_run(
         domain_id=domain.domain_id,
         domain_version=domain.version,
         filters=filters,
-        start_tier=payload.start_tier or "L2",
+        start_tier=payload.start_tier or "L3",
         run_input=run_input,
     )
 
@@ -222,7 +232,7 @@ def create_analysis_run(
             start_tier=request.start_tier,
             trace_id=trace_id,
         )
-        _dispatch(run_id, scope.project_id, request)
+        run_status = _dispatch_or_timeout(session, run_id, scope.project_id, request)
 
     return CreateRunResponse(run_id=run_id, status=run_status, reused=reused)
 
@@ -284,13 +294,16 @@ def retry_analysis_run(scope: RunScopeDep, session: SessionDep) -> CreateRunResp
             detail=f"原 Run 的时间范围无法解析，不能自动重试：{window}",
         ) from exc
 
+    from app.domains.registry import get_domain_registry
+    domain = get_domain_registry().load(stored.get("domain_id") or get_settings().default_domain_id,
+                                        stored.get("domain_version"))
     request = RunRequest(
         project_id=scope.project_id,
         source_id=int(run.source_id or 0),
         time_start=start,
         time_end=end,
-        domain_id=_load_domain().domain_id,
-        domain_version=_load_domain().version,
+        domain_id=domain.domain_id,
+        domain_version=domain.version,
         filters=stored.get("filters") or {},
         start_tier=stored.get("start_tier") or "L2",
         run_input=stored,
@@ -320,7 +333,7 @@ def retry_analysis_run(scope: RunScopeDep, session: SessionDep) -> CreateRunResp
             project_id=scope.project_id,
             trace_id=trace_id,
         )
-        _dispatch(new_run_id, scope.project_id, request)
+        new_status = _dispatch_or_timeout(session, new_run_id, scope.project_id, request)
 
     return CreateRunResponse(run_id=new_run_id, status=new_status, reused=reused)
 
@@ -338,6 +351,25 @@ def get_run(
     run = scope.run
     if project_id is not None:
         assert_same_project(scope.project_id, project_id, what="Run")
+    return _run_response(run)
+
+
+@router.get("/api/projects/{project_id}/runs", response_model=list[RunResponse], tags=["runs"])
+def list_project_runs(
+    scope: ProjectScopeDep, session: SessionDep,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    before_id: Annotated[int | None, Query(ge=1)] = None,
+) -> list[RunResponse]:
+    from app.models.agent_run import AgentRun
+    repo = AgentRunRepository(session)
+    statement = repo.scoped(scope.project_id)
+    if before_id is not None:
+        statement = statement.where(AgentRun.id < before_id)
+    rows = session.scalars(statement.order_by(AgentRun.id.desc()).limit(limit)).all()
+    return [_run_response(row) for row in rows]
+
+
+def _run_response(run) -> RunResponse:
     return RunResponse(
         id=int(run.id),
         project_id=int(run.project_id),
@@ -377,12 +409,9 @@ def get_run_detail(
 
     insights = InsightRepository(session).list_for_run(scope.project_id, scope.run_id)
     evidence_repo = EvidenceRepository(session)
-    evidence_by_insight = {
-        int(insight.id): evidence_repo.list_for_insight(
-            scope.project_id, int(insight.id)
-        )
-        for insight in insights
-    }
+    evidence_by_insight = {int(insight.id): [] for insight in insights}
+    for evidence in evidence_repo.list_for_insights(scope.project_id, list(evidence_by_insight)):
+        evidence_by_insight[int(evidence.insight_id)].append(evidence)
 
     detail = build_run_detail(
         run=run, insights=insights, evidence_by_insight=evidence_by_insight
@@ -456,6 +485,14 @@ def list_insight_evidence(
     rows = EvidenceRepository(session).list_for_insight(
         scope.project_id, scope.insight_id
     )
+    from sqlalchemy import select
+    from app.models.event import Event
+    ids = {int(i) for row in rows for i in (row.event_ids or [])}
+    events = session.scalars(select(Event).where(
+        Event.project_id == scope.project_id, Event.id.in_(ids))).all()
+    by_id = {int(event.id): {"id": int(event.id), "source_id": int(event.source_id),
+             "timestamp": event.timestamp.isoformat(), "severity": event.severity,
+             "message": event.message, "metadata": event.meta or {}} for event in events}
     return [
         EvidenceResponse(
             id=int(e.id),
@@ -465,6 +502,7 @@ def list_insight_evidence(
             time_range=e.time_range,
             calculation=e.calculation,
             description=e.description,
+            events=[by_id[int(i)] for i in (e.event_ids or []) if int(i) in by_id],
         )
         for e in rows
     ]
@@ -482,14 +520,13 @@ def _epoch() -> datetime:
 def _load_domain():
     from app.domains.registry import get_domain_registry
 
-    return get_domain_registry().load("computer_monitoring")
+    return get_domain_registry().load(get_settings().default_domain_id)
 
 
 def _dispatch(run_id: int, project_id: int, request: RunRequest) -> None:
     """把执行派发给 Celery。
 
-    派发失败**不吞掉**：标记成 error 字段由调用方看得到，但端点本身仍返回
-    202 + queued（因为 Run 已创建，前端可以去查状态）。
+    派发异常向上传递，由 _dispatch_or_timeout 写入真实终态和错误原因。
 
     `trace_id` 一并传过去：Worker 是另一个进程，contextvars 不会自己跨过去。
     不传的话 worker 会新起一个 trace_id，于是计划第 928 行那句
@@ -511,6 +548,22 @@ def _dispatch(run_id: int, project_id: int, request: RunRequest) -> None:
         )
     except Exception as exc:  # noqa: BLE001 - broker 不可用不该让创建失败
         logger.warning("派发 Run %s 到 Celery 失败：%s", run_id, exc)
+        raise
+
+
+def _dispatch_or_timeout(session, run_id: int, project_id: int, request: RunRequest) -> str:
+    try:
+        _dispatch(run_id, project_id, request)
+    except Exception:
+        runs = AgentRunRepository(session)
+        if runs.status_of(project_id, run_id) == enums.AGENT_RUN_QUEUED:
+            # 沿用已允许的 queued→timeout，不增加或绕过状态转移。
+            runs.apply_status(project_id, run_id, target=enums.AGENT_RUN_TIMEOUT,
+                              reason="dispatch_failed", error="任务派发失败，请检查队列后重新分析",
+                              metadata={"stop_reason": "dispatch_failed"})
+            session.commit()
+        return runs.status_of(project_id, run_id) or enums.AGENT_RUN_TIMEOUT
+    return enums.AGENT_RUN_QUEUED
 
 
 def _insight_response(insight: Insight) -> InsightResponse:

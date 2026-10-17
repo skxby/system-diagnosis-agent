@@ -1,20 +1,2 @@
-# uv 项目级配置
-#
-# ⚠️ 重要（已实测）：环境变量 UV_CACHE_DIR **优先级高于**本文件。
-# 本机全局设置了 UV_CACHE_DIR=D:\dev-cache\uv-cache，该路径在 DSH 沙箱下不可写
-# （workspace-write 只允许写工作区），于是 uv 直接失败：
-#   error: Failed to initialize cache at `D:\dev-cache\uv-cache`
-#   Caused by: failed to open file `D:\dev-cache\uv-cache\sdists-v9\.git`: 拒绝访问。(os error 5)
-# 结果是 `uv python list` / `uv pip` / `uv venv` 全部不可用。
-#
-# 实测结论：仅放本文件**不足以**修复，因为环境变量会覆盖它。
-# 所以在项目里跑 uv 前，必须显式覆盖环境变量：
-#
-#   $env:UV_CACHE_DIR = "E:\日志agent开发\.uv-cache"   # PowerShell
-#
-# 覆盖后 uv 一切正常（已实测：uv venv 建成 Python 3.13.14、uv pip install 成功）。
-# 若你希望一劳永逸，可把系统级 UV_CACHE_DIR 改到一个可写路径，或删掉该环境变量。
-#
-# 下面的 cache-dir 作为兜底：在没有 UV_CACHE_DIR 环境变量的机器/会话上生效。
-# .uv-cache/ 已被 .gitignore 忽略，不会进 Git。
+# 项目内缓存；UV_CACHE_DIR 环境变量的优先级高于本文件。
 cache-dir = ".uv-cache"

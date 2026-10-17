@@ -1,6 +1,6 @@
 r"""computer_monitoring 的行解析（原始行 → 原始字段）。
 
-只用标准库 `re` + `datetime`，**不调 LLM、不猜**（红线 1）。覆盖 `logs/` 里
+使用 `re`、`datetime` 与 dateutil 的英文日期解析，**不调 LLM、不猜**（红线 1）。覆盖 `logs/` 里
 真实存在的四类时间戳形态：
 
     Jun 14 15:16:01 combo sshd(pam_unix)[19939]: authentication failure; ...
@@ -24,6 +24,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 from typing import Any
+from dateutil.parser import parse as parse_datetime
 
 # `Jun 14 15:16:01`（`Jul  1` 是双空格）—— syslog 缺年份
 _SYSLOG_TS = r"[A-Z][a-z]{2} {1,2}\d{1,2} \d{2}:\d{2}:\d{2}"
@@ -172,9 +173,7 @@ def parse_apache_line(line: str) -> dict[str, Any] | None:
         return None
     try:
         # 同上：Apache 时间戳不带时区
-        ts = datetime.strptime(  # noqa: DTZ007
-            match.group("ts").strip("[]"), "%a %b %d %H:%M:%S %Y"
-        )
+        ts = parse_datetime(match.group("ts").strip("[]"))
     except ValueError:
         return None
     return {

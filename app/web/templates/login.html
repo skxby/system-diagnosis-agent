@@ -22,8 +22,7 @@
   </div>
 
   <p class="muted small mt">
-    自用单账号。登录成功后 token 存在 <code>httpOnly</code> Cookie 里，
-    页面脚本读不到它。
+    首次使用请创建本机账号；已有账号请登录。默认只允许首次初始化时注册。
   </p>
 </div>
 {% endblock %}
@@ -45,7 +44,9 @@ async function submit(register) {
       // 注册不设 Cookie，紧接着登录一次
       await API.post('/api/login', { email, password });
     }
-    location.href = queryParam('next') || '/projects';
+    const next = queryParam('next') || '/projects';
+    const target = new URL(next, location.origin);
+    location.href = target.origin === location.origin ? target.pathname + target.search : '/projects';
   } catch (error) {
     fail(error.message);
   }

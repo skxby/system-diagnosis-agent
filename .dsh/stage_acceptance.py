@@ -1,4 +1,4 @@
-"""阶段验收表（**真机口径**）：每条验收 = 测试证据 + 是否在真实路径上被调用。
+"""阶段验收表（**真机口径**）：每条验收 = 测试证据 + 真机接线 + 运行时实测。
 
 ## 为什么要重出一版
 
@@ -672,10 +672,8 @@ def verdict_of(
     missing = [h for h in wiring_hits if not h.reachable]
     if missing:
         return "❌ 未达标", "真机接线缺口：" + "、".join(h.symbol.rsplit(".", 1)[-1] for h in missing)
-    if item.test_only:
-        return (
-            ("✅ 达标", "") if tests_ok else ("❌ 未达标", "承载测试未找到或未通过")
-        )
+    if not tests_ok:
+        return "❌ 未达标", "承载测试未找到或未通过"
     if runtime is None:
         return "⚠️ 待实测", "测试 + 静态接线通过，本轮无运行时证据"
     state, detail = runtime
@@ -717,12 +715,14 @@ def main(argv: list[str]) -> int:
         else:
             wiring = "—（无锚点）"
         rt = runtime.get(item.runtime) if item.runtime else None
-        tests_ok = bool(item.tests) and all(
+        tests_ok = all(
             per_file.get(f, {}).get("tests", 0) > 0
             and per_file.get(f, {}).get("failures", 0) == 0
             and per_file.get(f, {}).get("errors", 0) == 0
             for f in item.tests
         )
+        if not item.tests:
+            tests_ok = total["tests"] > 0 and total["failures"] == 0 and total["errors"] == 0
         mark, reason = verdict_of(item, hits, rt, tests_ok)
         counts[mark if mark in counts else "⚠️ 待实测"] += 1
         if mark == "❌ 未达标":
@@ -750,7 +750,7 @@ def main(argv: list[str]) -> int:
         f"测试：{total['tests']} 用例 / 失败 {total['failures']} / 错误 {total['errors']} / 跳过 {total['skipped']}　|　"
         f"静态接线：入口点 {len(graph.entries)}，可达符号 {len(graph.reachable)}/{len(graph.defs)}",
         "",
-        "口径：**每条验收 = 测试证据 + 是否在真实路径上被调用**。三种证据见 `.dsh/stage_acceptance.py` 文件头。",
+        "口径：**每条验收 = 测试证据 + 真机接线 + 运行时实测**。三种证据见 `.dsh/stage_acceptance.py` 文件头。",
         "",
         "| # | 验收条目 | 测试证据 | 真机接线（静态） | 真机实测（运行时） | 结论 |",
         "|---|---|---|---|---|---|",

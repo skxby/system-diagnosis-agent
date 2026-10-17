@@ -15,6 +15,10 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+import re
+
+MONTHS = {name: f"{index:02}" for index, name in enumerate(
+    ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"), 1)}
 
 #: 判断「跨年」的容差：把当前年套到 (月,日) 上，若比现在晚超过这么多天，
 #: 认为它其实属于上一年（例：1 月读 12 月 31 日的日志）。
@@ -107,6 +111,8 @@ def parse_timestamp(
         raise TimestampUnparseableError("时间戳为空")
 
     text = str(raw).strip()
+    text = re.sub(r"\b(?:" + "|".join(MONTHS) + r")\b",
+                  lambda match: MONTHS[match.group()], text)
     if not text:
         raise TimestampUnparseableError("时间戳为空字符串")
 
@@ -121,8 +127,8 @@ def parse_timestamp(
         "%Y-%m-%d %H:%M:%S.%f",
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%dT%H:%M:%S",
-        "%d/%b/%Y:%H:%M:%S %z",  # nginx / apache access log
-        "%d/%b/%Y:%H:%M:%S",
+        "%d/%m/%Y:%H:%M:%S %z",  # 与进程 locale 无关
+        "%d/%m/%Y:%H:%M:%S",
         "%Y/%m/%d %H:%M:%S",
     )
     for fmt in formats:
@@ -146,7 +152,7 @@ def parse_timestamp(
 
 
 #: syslog 常见的两种写法（`Jul  1` 是双空格）
-_YEARLESS_FORMATS = ("%b %d %H:%M:%S", "%b  %d %H:%M:%S")
+_YEARLESS_FORMATS = ("%m %d %H:%M:%S", "%m  %d %H:%M:%S")
 
 
 def _parse_yearless(text: str, *, now: datetime | None) -> datetime | None:
@@ -158,9 +164,8 @@ def _parse_yearless(text: str, *, now: datetime | None) -> datetime | None:
         except ValueError:
             continue
         reference = now or datetime.now(timezone.utc)
-        year = resolve_year_for_month_day(probe.month, probe.day, now=reference)
         try:
-
+            year = resolve_year_for_month_day(probe.month, probe.day, now=reference)
             return datetime(  # noqa: DTZ001
                 year, probe.month, probe.day, probe.hour, probe.minute, probe.second
             )

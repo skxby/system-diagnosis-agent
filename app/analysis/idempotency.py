@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.gateways.base import (
+    ModelRequestError, ConfigurationError,
     ModelUnavailableError,
     StructuredOutputError,
 )
@@ -30,7 +31,7 @@ from app.policy import StopExecution
 
 #: 流水线版本。改动了分析步骤的顺序/语义就要升版本——它会进幂等键，
 #: 不升版本会让"同一键"在新旧流水线下指向不同语义的结果。
-PIPELINE_VERSION = "1.0.0"
+PIPELINE_VERSION = "1.1.0"
 
 
 @dataclass(frozen=True)
@@ -201,6 +202,8 @@ def classify_error(exc: BaseException) -> str:
     """
     if isinstance(exc, NonRetryableError):
         return exc.kind
+    if isinstance(exc, (ModelRequestError, ConfigurationError)):
+        return ErrorKind.AUTH
     if isinstance(exc, StopExecution):
         # 预算/额度到顶：计划第 716 行明确不可重试
         return ErrorKind.BUDGET

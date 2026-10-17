@@ -4,7 +4,7 @@
 → 下次分析自动加载。修订说明第 1 条明确：不让前端直接读写 YAML，否则文件格式
 会耦进 UI，且无法做 evidence 校验。
 
-**写入位置是数据卷**（`${DATA_DIR}/knowledge/<domain>/...`），
+**写入位置是数据卷**（`${DATA_DIR}/projects/<project_id>/knowledge/<domain>/...`），
 绝不写代码目录（修订说明第 2 条最后一句）。
 """
 
@@ -34,27 +34,36 @@ from app.config import get_settings
 
 router = APIRouter()
 
-DOMAIN_ID = "computer_monitoring"
+from app.utils.atomic_files import atomic_write, file_lock, project_data_dir
+
+
+def _domain_id() -> str:
+    return get_settings().default_domain_id
 
 #: 要求调用方以 query 参数给出 project_id，并校验归属当前用户
-OwnedProjectId = Annotated[int, Depends(get_owned_project_id)]
+def _locked_project(project_id: Annotated[int, Depends(get_owned_project_id)]):
+    with file_lock(_staging_file(project_id)):
+        yield project_id
+
+
+OwnedProjectId = Annotated[int, Depends(_locked_project)]
 
 
 def _data_dir() -> Path:
     return Path(get_settings().data_dir)
 
 
-def _confirmed_dir() -> Path:
-    return _data_dir() / "knowledge" / DOMAIN_ID / "confirmed"
+def _confirmed_dir(project_id: int) -> Path:
+    return project_data_dir(_data_dir(), project_id) / "knowledge" / _domain_id() / "confirmed"
 
 
-def _staging_file() -> Path:
-    return staging_path(_data_dir(), DOMAIN_ID)
+def _staging_file(project_id: int) -> Path:
+    return staging_path(_data_dir(), _domain_id(), project_id)
 
 
-def _read_staging() -> list[dict[str, Any]]:
+def _read_staging(project_id: int) -> list[dict[str, Any]]:
     try:
-        return load_candidates(_staging_file())
+        return load_candidates(_staging_file(project_id))
     except KnowledgeStagingError as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -62,16 +71,14 @@ def _read_staging() -> list[dict[str, Any]]:
         ) from exc
 
 
-def _write_staging(candidates: list[dict[str, Any]]) -> None:
-    path = _staging_file()
+def _write_staging(project_id: int, candidates: list[dict[str, Any]]) -> None:
+    path = _staging_file(project_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        yaml.safe_dump(candidates, allow_unicode=True, sort_keys=False), encoding="utf-8"
-    )
+    atomic_write(path, yaml.safe_dump(candidates, allow_unicode=True, sort_keys=False))
 
 
-def _find(candidate_id: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    candidates = _read_staging()
+def _find(project_id: int, candidate_id: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    candidates = _read_staging(project_id)
     for item in candidates:
         if str(item.get("id")) == candidate_id:
             return candidates, item
@@ -100,9 +107,9 @@ def _assert_confirmable(item: dict[str, Any]) -> None:
         )
 
 
-def _move_to_confirmed(item: dict[str, Any], *, kind_override: str | None = None) -> None:
+def _move_to_confirmed(project_id: int, item: dict[str, Any], *, kind_override: str | None = None) -> None:
     """把条目从 staging 移入 confirmed（修订说明第 2 条的两层结构）。"""
-    confirmed_dir = _confirmed_dir()
+    confirmed_dir = _confirmed_dir(project_id)
     confirmed_dir.mkdir(parents=True, exist_ok=True)
     target = confirmed_dir / "runtime_confirmed.yaml"
 
@@ -122,25 +129,21 @@ def _move_to_confirmed(item: dict[str, Any], *, kind_override: str | None = None
 
     kept = [c for c in existing if str(c.get("id")) != entry["id"]]
     kept.append(entry)
-    target.write_text(
-        yaml.safe_dump(kept, allow_unicode=True, sort_keys=False), encoding="utf-8"
-    )
+    atomic_write(target, yaml.safe_dump(kept, allow_unicode=True, sort_keys=False))
 
 
-def _remove_from_staging(candidate_id: str) -> None:
-    candidates = _read_staging()
+def _remove_from_staging(project_id: int, candidate_id: str) -> None:
+    candidates = _read_staging(project_id)
     kept = [c for c in candidates if str(c.get("id")) != candidate_id]
-    _write_staging(kept)
+    _write_staging(project_id, kept)
 
 
-def _archive_candidate(item: dict[str, Any], bucket: str) -> Path:
+def _archive_candidate(project_id: int, item: dict[str, Any], bucket: str) -> Path:
     """把被丢弃/标误报的候选挪到归档目录，便于事后复查。"""
-    archive_dir = _data_dir() / "knowledge" / DOMAIN_ID / bucket
+    archive_dir = project_data_dir(_data_dir(), project_id) / "knowledge" / _domain_id() / bucket
     archive_dir.mkdir(parents=True, exist_ok=True)
     path = archive_dir / f"{item.get('id')}.yaml"
-    path.write_text(
-        yaml.safe_dump(item, allow_unicode=True, sort_keys=False), encoding="utf-8"
-    )
+    atomic_write(path, yaml.safe_dump(item, allow_unicode=True, sort_keys=False))
     return path
 
 
@@ -167,7 +170,7 @@ def list_candidates(scope: ProjectScopeDep) -> list[KnowledgeCandidateResponse]:
             confidence=float(c.get("confidence") or 0.0),
             status=str(c.get("status", "draft")),
         )
-        for c in _read_staging()
+        for c in _read_staging(scope.project_id)
     ]
 
 
@@ -179,7 +182,7 @@ def list_candidates(scope: ProjectScopeDep) -> list[KnowledgeCandidateResponse]:
 def list_confirmed(scope: ProjectScopeDep) -> list[KnowledgeCandidateResponse]:
     """列出已生效知识（含 seed 与运行时两部分）。"""
     out: list[KnowledgeCandidateResponse] = []
-    for directory in (_seed_dir(), _confirmed_dir()):
+    for directory in (_seed_dir(), _confirmed_dir(scope.project_id)):
         if not directory.is_dir():
             continue
         for path in sorted(directory.glob("*.y*ml")):
@@ -212,10 +215,10 @@ def confirm_candidate(
     candidate_id: str, project_id: OwnedProjectId
 ) -> KnowledgeActionResponse:
     """确认候选 → 移入 confirmed（下次分析生效）。"""
-    _, item = _find(candidate_id)
+    _, item = _find(project_id, candidate_id)
     _assert_confirmable(item)
-    _move_to_confirmed(item)
-    _remove_from_staging(candidate_id)
+    _move_to_confirmed(project_id, item)
+    _remove_from_staging(project_id, candidate_id)
     return KnowledgeActionResponse(
         candidate_id=candidate_id, action="confirm", status="confirmed"
     )
@@ -230,7 +233,7 @@ def edit_candidate(
     candidate_id: str, payload: EditCandidateRequest, project_id: OwnedProjectId
 ) -> KnowledgeCandidateResponse:
     """编辑候选（编辑后再确认）。只允许改白名单字段。"""
-    candidates, item = _find(candidate_id)
+    candidates, item = _find(project_id, candidate_id)
     updates = payload.model_dump(exclude_none=True)
     if not updates:
         raise HTTPException(
@@ -238,7 +241,7 @@ def edit_candidate(
         )
     item.update(updates)
     item["updated_at"] = datetime.now(timezone.utc).isoformat()
-    _write_staging(candidates)
+    _write_staging(project_id, candidates)
 
     return KnowledgeCandidateResponse(
         id=str(item.get("id", "")),
@@ -261,9 +264,9 @@ def reject_candidate(
     candidate_id: str, project_id: OwnedProjectId
 ) -> KnowledgeActionResponse:
     """丢弃候选：移出 staging 并归档，便于事后复查。"""
-    _, item = _find(candidate_id)
-    _archive_candidate(item, "rejected")
-    _remove_from_staging(candidate_id)
+    _, item = _find(project_id, candidate_id)
+    _archive_candidate(project_id, item, "rejected")
+    _remove_from_staging(project_id, candidate_id)
     return KnowledgeActionResponse(candidate_id=candidate_id, action="reject", status="rejected")
 
 
@@ -279,13 +282,13 @@ def mark_false_positive(
 
     计划第 486 行：false_positive 命中则抑制该误报。
     """
-    _, item = _find(candidate_id)
-    _archive_candidate(item, "false_positives")
+    _, item = _find(project_id, candidate_id)
+    _archive_candidate(project_id, item, "false_positives")
     entry = dict(item)
     entry["kind"] = "false_positive"
     entry["status"] = "confirmed"
-    _move_to_confirmed(entry, kind_override="false_positive")
-    _remove_from_staging(candidate_id)
+    _move_to_confirmed(project_id, entry, kind_override="false_positive")
+    _remove_from_staging(project_id, candidate_id)
     return KnowledgeActionResponse(
         candidate_id=candidate_id, action="false-positive", status="confirmed"
     )
@@ -293,10 +296,5 @@ def mark_false_positive(
 
 def _seed_dir() -> Path:
     """领域目录包里的 seed 知识（代码资产，只读）。"""
-    return (
-        Path(__file__).resolve().parents[1]
-        / "domains"
-        / DOMAIN_ID
-        / "knowledge"
-        / "confirmed"
-    )
+    from app.domains.registry import get_domain_registry
+    return Path(get_domain_registry().load(_domain_id()).knowledge_dir()) / "knowledge" / "confirmed"

@@ -50,6 +50,10 @@ class StructuredOutputError(GatewayError):
     """
 
 
+class ModelRequestError(GatewayError):
+    """上游拒绝请求（认证/参数），重试和切换等级均无意义。"""
+
+
 class L0DoesNotCallModelError(GatewayError):
     """L0 是代码/规则等级，不该发起模型调用（计划第 599 行）。"""
 

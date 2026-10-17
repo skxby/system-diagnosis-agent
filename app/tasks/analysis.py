@@ -64,15 +64,29 @@ def _execute(
                 "Run %s 不存在（project %s），任务不做事", run_id, project_id
             )
             return {"run_id": run_id, "status": "missing"}
+        current_status = runs.status_of(project_id, run_id)
+        if current_status != "queued":
+            return {"run_id": run_id, "status": current_status, "reused": True}
 
-        domain = get_domain_registry().load("computer_monitoring")
+        domain = get_domain_registry().load(
+            (run.input or {}).get("domain_id") or _settings().default_domain_id,
+            (run.input or {}).get("domain_version"))
 
         # 载入本次事件（受 project 边界约束）。
         # 必须经 EventRepository.pipeline_events —— 那里是 ORM→链路字段映射的
         # 唯一真源。早先这里手写了一份"看起来等价"的映射，唯独漏了 metadata
         # （进程名在其中），于是 analyzer 全部判定"无异常"、复杂度落到 L0、
         # 模型一次都没被调用，Run 却显示 completed。
-        events = EventRepository(session).pipeline_events(project_id)
+        snapshot = run.input or {}
+        window = snapshot.get("time_range") or {}
+        from datetime import datetime
+        time_start = datetime.fromisoformat(window["start"])
+        time_end = datetime.fromisoformat(window["end"])
+        events = EventRepository(session).pipeline_events(
+            project_id, source_id=int(run.source_id), time_start=time_start,
+            time_end=time_end, filters=snapshot.get("filters") or {},
+            max_event_id=snapshot.get("source_revision"),
+        )
         # 事件条数是排障的第一现场：0 条事件会让整条链路"成功地产出零结论"，
         # 而这个数字是唯一能一眼看出来的证据
         logger.info("run_events_loaded", event_count=len(events))
@@ -87,7 +101,7 @@ def _execute(
         historical_incidents = load_historical_incidents(
             IncidentRepository(session), project_id
         )
-        confirmed_knowledge = load_confirmed_knowledge(domain)
+        confirmed_knowledge = load_confirmed_knowledge(domain, project_id=project_id)
         logger.info(
             "run_context_sources",
             historical_incidents=len(historical_incidents),
@@ -96,6 +110,19 @@ def _execute(
 
         executor = RunExecutor(run_repository=runs, checkpoint=session.commit)
         captured: dict[str, Any] = {}
+
+        def record_phase(name: str) -> None:
+            executor.check_cancel(project_id, run_id)
+            if runs.status_of(project_id, run_id) != "running":
+                raise CancelledError("Run 已终止，停止推进阶段")
+            session.refresh(run)
+            history = list(run.phase_history or [])
+            history.append({"phase": name, "status": "running", "at": _utcnow().isoformat()})
+            if len(history) > 1 and history[-2].get("status") == "running":
+                history[-2] = {**history[-2], "status": "done"}
+            runs.apply_progress(project_id, run_id, current_phase=name, phase_history=history)
+            executor.heartbeat(project_id, run_id)
+
 
         # 一次 Run 一个成本控制器：三道检查点（Pre 已在创建端点做过、
         # Mid 在每次调用前、Post 在下面累加预算）共用同一份用量账。
@@ -128,27 +155,20 @@ def _execute(
 
             from app.gateways.router import build_router
 
-            settings = _settings()
-            try:
-                router = build_router(settings, run_repository=runs)
-            except Exception as exc:
-                # 装配 router 失败（配置缺失、凭据找不到…）必须留痕。
-                # 否则它会被降级链当成"这个等级失败"吞掉，
-                # 最终以"分析完成、零结论"收场 —— 真正的原因一个字都不剩。
-                logger.error(
-                    "build_router_failed",
-                    tier=tier,
-                    error=f"{type(exc).__name__}: {exc}",
-                )
-                raise
+            class LazyRouter:
+                """L0 不需要模型配置；仅当链路实际调用模型时装配网关。"""
+                def __init__(self):
+                    self.router = None
 
-            # Mid-check（计划第 646–648 行）：包住 router，让**每次模型调用前**
-            # 都过一次策略（调用次数 / token / 时长 / 单次成本）。不包的话
-            # 这些上限只写在配置里，Run 可以一直调到模型侧先受不了为止。
-            if controller is not None:
-                from app.policy.wiring import PolicyGuardedRouter
+                def generate(self, **kwargs):
+                    if self.router is None:
+                        self.router = build_router(_settings(), run_repository=runs)
+                        if controller is not None:
+                            from app.policy.wiring import PolicyGuardedRouter
+                            self.router = PolicyGuardedRouter(self.router, controller)
+                    return self.router.generate(**kwargs)
 
-                router = PolicyGuardedRouter(router, controller)
+            router = LazyRouter()
 
             result = analyze(
                 PipelineInput(
@@ -156,8 +176,8 @@ def _execute(
                     source_id=int(run.source_id or 0),
                     domain_id=domain.domain_id,
                     domain_version=domain.version,
-                    time_start=run.started_at or _utcnow(),
-                    time_end=_utcnow(),
+                    time_start=time_start,
+                    time_end=time_end,
                     events=events,
                     historical_incidents=historical_incidents,
                     confirmed_knowledge=confirmed_knowledge,
@@ -168,6 +188,8 @@ def _execute(
                 record=True,
                 project_id_for_recording=project_id,
                 run_id=run_id,
+                on_phase=record_phase,
+                model_tier_cap=tier,
             )
             captured["result"] = result
             # 工具执行记录落进 Run（阶段 05 验收）：不记的话，
@@ -193,13 +215,14 @@ def _execute(
             # 一个"已完成但 0 条结论"的 Run 留在库里 —— 恰好是红线 4 要禁止的含糊。
             # 放进 attempt_tier 里，落库失败就变成一次**等级尝试失败**，
             # 由降级链与状态机如实收尾成 failed，并把真实原因写进 error。
+            record_phase("persistence")
             captured["persisted"] = _persist_result(
                 session, project_id=project_id, run_id=run_id, run=run, result=result
             )
             logger.info("insights_persisted", **captured["persisted"])
             # 候选知识写 staging（计划第 751 行）：不写的话「待确认知识」区永远是空的，
             # 8.1 知识闭环只剩"人工确认"这一半 —— 没有候选可确认。
-            _stage_knowledge_candidates(domain, result, run_id=run_id)
+            _stage_knowledge_candidates(domain, result, run_id=run_id, project_id=project_id)
 
             # 模型调用失败换来的纯规则报告：这一级算**失败**，交给降级链继续
             # 尝试其它等级，全都不行时再由 `rules_only()` 产出最终报告 ——
@@ -207,11 +230,14 @@ def _execute(
             # （计划第 724 行）。不抛的话它会以 `completed` 收场，
             # 用户看到的是一份"没有异常"的干净报告（真机核验 2026-09-24）。
             if getattr(result, "model_unavailable", False):
-                from app.gateways.base import ModelUnavailableError
+                from app.gateways.base import ModelUnavailableError, ModelRequestError
 
-                raise ModelUnavailableError(
+                error_type = ModelUnavailableError if result.model_failure_retryable else ModelRequestError
+                failure = error_type(
                     "模型调用失败，本级只产出纯规则报告；交由降级链继续尝试其它等级"
                 )
+                failure.tier_used = result.tier
+                raise failure
 
             if result.stop_reason:
                 # 策略到顶：把**已经拿到的结论落库之后**再上抛，
@@ -236,8 +262,8 @@ def _execute(
                     source_id=int(run.source_id or 0),
                     domain_id=domain.domain_id,
                     domain_version=domain.version,
-                    time_start=run.started_at or _utcnow(),
-                    time_end=_utcnow(),
+                    time_start=time_start,
+                    time_end=time_end,
                     events=events,
                     historical_incidents=historical_incidents,
                     confirmed_knowledge=confirmed_knowledge,
@@ -247,6 +273,8 @@ def _execute(
                 router=None,  # 不调模型
             )
             captured["result"] = result
+            captured["persisted"] = _persist_result(session, project_id=project_id,
+                run_id=run_id, run=run, result=result)
             return result
 
         try:
@@ -264,6 +292,8 @@ def _execute(
         # 落库已在 attempt_tier 内完成（见那里的说明）。这里只取结果：
         # 失败时 captured 里没有它，Run 已被降级链收尾成 failed。
         result = captured.get("result")
+        if result is None and not outcome.attempts:
+            return {"run_id": run_id, "status": outcome.status, "reused": True}
         persisted = captured.get("persisted") or {
             "insight_count": 0,
             "evidence_count": 0,
@@ -301,6 +331,14 @@ def _execute(
             metadata_extra["used_rules_only"] = bool(result.used_rules_only)
             metadata_extra["context_tokens"] = int(result.context_tokens)
             metadata_extra["model_attempts"] = result.model_attempts
+            import json
+            metadata_extra["rules_only_report"] = json.loads(json.dumps(
+                result.rules_only_report, default=lambda value: value.isoformat()))
+            metadata_extra["tier"] = result.tier
+            metadata_extra["complexity"] = result.complexity.as_dict()
+            metadata_extra["event_count"] = len(events)
+            metadata_extra["analysis_scope"] = {"source_id": run.source_id, **window,
+                                                 "filters": snapshot.get("filters") or {}}
         # 合并必须基于**库里的当前值**：这段时间里 Run 可能已被回收/取消，
         # 那些原因（stop_reason / note）不能被这份旧快照抹掉。
         runs.merge_run_metadata(project_id, run_id, metadata_extra)
@@ -383,6 +421,7 @@ def _persist_result(
         EvidencePersistenceError,
         persist_grouping,
         persist_insights,
+        assert_no_evidence_violation,
     )
     from app.repositories.event import EventRepository
     from app.repositories.event_group import EventGroupRepository
@@ -415,7 +454,9 @@ def _persist_result(
                 evidence_repository=EvidenceRepository(session),
                 source_id=int(run.source_id) if run.source_id else None,
                 incident_by_event=grouping.incident_by_event,
+                timestamps_by_event=_event_timestamps(session, project_id, result.valid_event_ids),
             )
+            assert_no_evidence_violation(written)
     except EvidencePersistenceError as exc:
         logger.error(
             "insights_rejected_by_evidence_gate", run_id=run_id, error=str(exc)
@@ -437,6 +478,14 @@ def _persist_result(
     return {**written.as_dict(), **(grouping.as_dict() if grouping is not None else {})}
 
 
+def _event_timestamps(session, project_id: int, event_ids: list[str]) -> dict:
+    from sqlalchemy import select
+    from app.models.event import Event
+    return {str(event_id): timestamp for event_id, timestamp in session.execute(
+        select(Event.id, Event.timestamp).where(Event.project_id == project_id,
+                                              Event.id.in_([int(i) for i in event_ids])))}
+
+
 def load_historical_incidents(incident_repository: Any, project_id: int, *, limit: int = 5) -> list[dict]:
     """取本项目最近的历史事故，供 Context 注入（计划第 787 行）。"""
     try:
@@ -448,10 +497,12 @@ def load_historical_incidents(incident_repository: Any, project_id: int, *, limi
         return []
 
 
-def load_confirmed_knowledge(domain: Any) -> list[Any]:
+def load_confirmed_knowledge(domain: Any, *, project_id: int | None = None) -> list[Any]:
     """加载领域已确认知识（阶段 03 的加载器；候选(staging)不参与）。"""
     try:
-        knowledge = domain.knowledge(data_dir=_settings().data_dir)
+        from app.utils.atomic_files import project_data_dir
+        base = project_data_dir(_settings().data_dir, project_id) if project_id else _settings().data_dir
+        knowledge = domain.knowledge(data_dir=base)
     except Exception as exc:  # noqa: BLE001 - 知识库读不到不该让分析失败
         logger.warning("knowledge_unavailable", error=f"{type(exc).__name__}: {exc}")
         return []
@@ -464,7 +515,7 @@ def _record_tool_usage(runs: Any, project_id: int, run_id: int, result: Any) -> 
         runs.append_tool_usage(project_id, run_id, entry)
 
 
-def _stage_knowledge_candidates(domain: Any, result: Any, *, run_id: int) -> None:
+def _stage_knowledge_candidates(domain: Any, result: Any, *, run_id: int, project_id: int | None = None) -> None:
     """把候选知识写入 staging（计划第 751 行）。
 
     失败只记日志、不让分析失败：候选是**副产品**，主结果是结论与证据；
@@ -478,7 +529,8 @@ def _stage_knowledge_candidates(domain: Any, result: Any, *, run_id: int) -> Non
     try:
         stats = write_candidates(
             data_dir=_settings().data_dir,
-            domain_id=getattr(domain, "domain_id", "computer_monitoring"),
+            domain_id=domain.domain_id,
+            project_id=project_id,
             candidates=candidates,
             run_id=run_id,
             valid_event_ids=set(getattr(result, "valid_event_ids", None) or []),
@@ -495,9 +547,8 @@ def _record_crash(
 ) -> None:
     """把逃逸异常如实写进 Run（尽量），失败只记日志。
 
-    只在 Run 处于 `running` 时改状态：`queued → failed` 不是计划里允许的转移，
-    硬改就是绕过状态机。停在 queued 的 Run 由心跳超时回收判定
-    （见 state_machine 里对 `queued → timeout` 的说明）。
+    running 异常收为 failed；执行准备阶段的 queued 异常沿用已有 queued→timeout，
+    明确记录 preparation_failed，不留下永久排队的记录。
     """
     from app.analysis.idempotency import classify_error
     from app.models import enums
@@ -525,6 +576,11 @@ def _record_crash(
             )
             return
         if current != enums.AGENT_RUN_RUNNING:
+            if current == enums.AGENT_RUN_QUEUED:
+                runs.apply_status(project_id, run_id, target=enums.AGENT_RUN_TIMEOUT,
+                    reason="preparation_failed", error=f"执行准备失败：{message}",
+                    metadata={"stop_reason": "preparation_failed"})
+                session.commit()
             logger.error(
                 "execute_run_crashed_before_running",
                 run_id=run_id,

@@ -43,6 +43,7 @@ function showError(message) {
   const box = document.getElementById('page-error');
   if (!box) { alert(message); return; }
   box.textContent = message;
+  box.className = 'banner banner-error';
   box.hidden = false;
 }
 function clearError() {
@@ -55,7 +56,7 @@ function el(tag, attrs = {}, children = []) {
   for (const [key, value] of Object.entries(attrs)) {
     if (key === 'class') node.className = value;
     else if (key === 'text') node.textContent = value;
-    else if (key === 'html') node.innerHTML = value;
+    else if (key === 'html') throw new Error('请使用 text 渲染内容');
     else if (key.startsWith('on')) node.addEventListener(key.slice(2), value);
     else if (value !== undefined && value !== null) node.setAttribute(key, value);
   }
@@ -113,8 +114,10 @@ document.addEventListener('DOMContentLoaded', () => {
   if (logout) {
     logout.addEventListener('click', async () => {
       // 清掉 Cookie：让服务端把它置空
-      document.cookie = 'access_token=; Max-Age=0; path=/';
-      location.href = '/login';
+      try {
+        await API.post('/api/logout');
+        location.href = '/login';
+      } catch (error) { showError(`退出失败：${error.message}`); }
     });
   }
 });

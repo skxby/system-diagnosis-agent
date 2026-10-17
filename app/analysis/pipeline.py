@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 from app.analysis.complexity import (
     LOW_CONFIDENCE_ESCALATION,
@@ -161,6 +161,7 @@ class PipelineResult:
     #: 真机核验（2026-09-24）：Key 无效时 Run 被标成 `completed`、
     #: 零结论零花费，看起来像"分析跑完了没发现异常"。
     model_unavailable: bool = False
+    model_failure_retryable: bool = True
     evidence_rejections: int = 0
     notes: list[str] = field(default_factory=list)
     valid_event_ids: list[str] = field(default_factory=list)
@@ -361,12 +362,16 @@ def analyze(
     record: bool = False,
     project_id_for_recording: int | None = None,
     run_id: int | None = None,
+    on_phase: Callable[[str], None] | None = None,
+    model_tier_cap: str | None = None,
 ) -> PipelineResult:
     """跑完整条链路。
 
     `router=None` 时**只做确定性部分**（L0 纯规则报告）——这让链路在没有模型
     的情况下也可测、可跑，也让"模型不可用降级到 L0"这条路径有真实实现。
     """
+    phase = on_phase or (lambda name: None)
+    phase("statistics")
     events = list(pipeline_input.events)
     valid_ids = build_valid_event_ids(events)
 
@@ -374,6 +379,7 @@ def analyze(
     statistics, stats_tool_run = compute_statistics(events)
     tool_runs: list[dict[str, Any]] = [stats_tool_run]
 
+    phase("grouping")
     # ---- 模板聚类 / 分组 ----
     groupable = [
         GroupableEvent(
@@ -401,6 +407,7 @@ def analyze(
         for g in formed
     ]
 
+    phase("detection")
     # ---- 检测（固定顺序）----
     anomalies, detection_notes = run_detection(
         events, analyzers=analyzers, confirmed_knowledge=pipeline_input.confirmed_knowledge
@@ -412,6 +419,7 @@ def analyze(
     if attached:
         detection_notes.append(f"{attached} 条异常附上了对应的 runbook")
 
+    phase("incidents")
     # ---- 事故归并（在检测之后：签名来自 analyzer）----
     signature_by_group: dict[int, str] = {}
     for index, group in enumerate(groups):
@@ -445,6 +453,7 @@ def analyze(
     for group in groups:
         group.pop("_index", None)
 
+    phase("complexity")
     # ---- 复杂度评估 ----
     complexity = assess_complexity(
         total_events=len(events),
@@ -459,7 +468,7 @@ def analyze(
     )
 
     result = PipelineResult(
-        tier=complexity.tier,
+        tier=min(complexity.tier, model_tier_cap) if model_tier_cap else complexity.tier,
         complexity=complexity,
         context_tokens=0,
         groups=groups,
@@ -482,11 +491,12 @@ def analyze(
             result.notes.append("L0：无 error 且无 anomaly，产出纯代码统计报告，未调用模型")
         return result
 
+    phase("context")
     # ---- Context 组装与蒸馏 ----
     samples, filter_tool_run = _select_samples(events)
     result.tool_runs.append(filter_tool_run)
     context = build_distilled_context(
-        tier=complexity.tier,
+        tier=result.tier,
         metadata={
             "domain": pipeline_input.domain_id,
             "domain_version": pipeline_input.domain_version,
@@ -514,14 +524,15 @@ def analyze(
 
     # 未显式指定时按等级给输出预算（见函数开头说明）
     if max_output_tokens is None:
-        max_output_tokens = OUTPUT_TOKEN_BUDGET_BY_TIER.get(complexity.tier, 2000)
+        max_output_tokens = OUTPUT_TOKEN_BUDGET_BY_TIER.get(result.tier, 2000)
 
     # ---- 模型分析（含幻觉校验与带反馈重试）----
+    phase("model_analysis")
     _run_model_analysis(
         result,
         context=context,
         router=router,
-        complexity_tier=complexity.tier,
+        complexity_tier=result.tier,
         max_output_tokens=max_output_tokens,
         enable_self_critique=enable_self_critique,
         record=record,
@@ -536,16 +547,17 @@ def analyze(
     # `LOW_CONFIDENCE_ESCALATION`、`should_escalate_after_l2` 全都在，
     # **但没有任何真实路径传过 l2_confidence** —— 于是"置信度不足自动升级"
     # 只在单测里成立，真机上永远不发生。
-    _maybe_escalate_to_l3(
-        result,
-        context=context,
-        router=router,
-        max_output_tokens=OUTPUT_TOKEN_BUDGET_BY_TIER.get(TIER_L3, 8000),
-        enable_self_critique=enable_self_critique,
-        record=record,
-        project_id=project_id_for_recording or pipeline_input.project_id,
-        run_id=run_id,
-    )
+    if model_tier_cap in (None, TIER_L3):
+        _maybe_escalate_to_l3(
+            result,
+            context=context,
+            router=router,
+            max_output_tokens=OUTPUT_TOKEN_BUDGET_BY_TIER.get(TIER_L3, 8000),
+            enable_self_critique=enable_self_critique,
+            record=record,
+            project_id=project_id_for_recording or pipeline_input.project_id,
+            run_id=run_id,
+        )
     return result
 
 
@@ -766,7 +778,8 @@ def _run_model_analysis(
             result.stop_reason = exc.reason
             result.notes.append(f"已达策略上限，提前停止：{exc.message}")
             break
-        except StructuredOutputError:
+        except StructuredOutputError as exc:
+            exc.tier_used = complexity_tier
             # 结构化输出失败是**可以换个等级再试**的：常见原因是输出被 token
             # 上限截断，或该等级不擅长按格式作答。**上抛**给 RunExecutor 的
             # 降级链处理（L3→L2→L1），而不是在这里直接放弃。
@@ -778,6 +791,8 @@ def _run_model_analysis(
             )
             raise
         except Exception as exc:  # noqa: BLE001 - 其余失败（如模型不可用）走纯规则兜底
+            from app.gateways.base import ModelRequestError, ConfigurationError
+            result.model_failure_retryable = not isinstance(exc, (ModelRequestError, ConfigurationError))
             result.notes.append(
                 f"模型调用失败（{type(exc).__name__}: {exc}），已降级为纯规则报告"
             )

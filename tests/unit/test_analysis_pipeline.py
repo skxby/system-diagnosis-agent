@@ -1052,6 +1052,18 @@ def _l2_events() -> list[dict]:
     ]
 
 
+@pytest.mark.parametrize("cap", ["L1", "L2"])
+def test_fallback_cap_controls_real_model_tier_and_prevents_reescalation(cap):
+    from app.analysis.pipeline import PipelineInput, analyze
+    router = TierRecordingRouter(l2_confidence=0.2)
+    result = analyze(PipelineInput(project_id=1, source_id=1, domain_id="computer_monitoring",
+        domain_version="1.0.0", time_start=T0, time_end=T0 + timedelta(hours=1), events=_l2_events()),
+        analyzers=_fake_domain().analyzers(), domain=_fake_domain(), router=router, model_tier_cap=cap)
+    assert result.complexity.tier == "L2"
+    assert router.tiers == [cap]
+    assert result.tier == cap
+
+
 def test_low_l2_confidence_escalates_and_reruns_at_l3():
     """L2 结论平均置信度低于阈值 → 真的再用 L3 跑一次，并采用 L3 的结论。
 

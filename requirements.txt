@@ -20,6 +20,9 @@ redis
 # --- 配置 / 结构化日志 ---
 pydantic-settings
 structlog
+PyYAML>=6,<7
+filelock>=3.20.1,<4
+tzdata
 
 # --- 鉴权 ---
 # 直接用 bcrypt，不用 passlib（passlib 自 2020 年起无人维护，
@@ -36,6 +39,7 @@ python-dateutil
 # --- 测试 ---
 pytest
 pytest-asyncio
+pytest-cov>=7,<8
 # 注：计划里提到 pytest-celery 作为可选项。它默认会拉起一个 Docker 托管的
 # worker 容器，测试期会额外拉镜像。计划同时给了「或直接测函数」的替代路径，
 # 阶段 01 先走后者，等阶段 08 真正需要端到端验证 Worker 时再决定是否引入。

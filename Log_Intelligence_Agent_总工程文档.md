@@ -77,7 +77,7 @@ Browser（极简页面）
 # 5. 技术栈（稳定基线）
 
 ```text
-Python 3.11+ / FastAPI
+Python 3.13 / FastAPI
 SQLAlchemy 2.0（Mapped + select）/ Alembic
 PostgreSQL 15+（JSONB）
 Redis 7 + Celery（+ Beat）
@@ -145,8 +145,9 @@ V3    受控执行：Action / 审批 / 权限 / 回滚 / 审计；UI 无代码�
 
 | 文档 | 作用 | 位置 |
 |---|---|---|
+| 当前实现与审计 | 接线、边界、处置证据 | `docs/architecture.md` / `docs/audit-2026-10-17.md` |
 | **本总纲** | 项目全貌、跨版本路线、接续入口 | `Log_Intelligence_Agent_总工程文档.md` |
-| V1 详细计划 | V1 阶段施工 / 数据模型 / 验收 | `Log_Intelligence_Agent_V1_个人全栈工程编码计划.md` |
+| V1 详细计划 | V1 阶段施工 / 数据模型 / 验收 | `Log_Intelligence_Agent_V1_个人全栈工程编码计划.md（最新版）.md` |
 | V1.5 计划（待建） | 主动分析 / MCP / 基线 | 新窗口按本总纲第 10 节创建 |
 | V2 计划（待建） | 因果 / 趋势 / 连接器 | 同上 |
 | 调研总报告 | 垂直能力修正框架与来源 | 飞书：`Yl8lblb87okNLWxiKH1caCJunhc` |
@@ -154,7 +155,6 @@ V3    受控执行：Action / 审批 / 权限 / 回滚 / 审计；UI 无代码�
 | 商业产品调研 | 11 产品六层差异 | 飞书：`FP5FbumZLoH68RxAvpjcK0xSnFe` |
 | 垂直 Agent 案例 | Harvey / Sierra / Decagon 等 | 飞书：`Jt1Rbh4WwoSIs2xliorc4M1bnId` |
 | 社区声音调研 | HN / Reddit / V2EX / 知乎 | 飞书：`Znhgb7CyFobxX6x8AtJcIDLcnBf` |
-| Claude 评审提示词 | 项目对外评审用 | `Log_Agent_项目评审_Claude提示词.md` |
 
 > 新增任何版本计划后，回到本表补一行——这是防止「文档散落 / 替代丢失」的唯一机制。
 

@@ -73,11 +73,11 @@ def _request(project, source, **overrides) -> RunRequest:
     base = {
         "project_id": project.id,
         "source_id": source.id,
-        "time_start": T0,
-        "time_end": T0 + timedelta(hours=1),
+        "time_start": datetime(1970, 1, 1, tzinfo=UTC),
+        "time_end": datetime(2100, 1, 1, tzinfo=UTC),
         "domain_id": "computer_monitoring",
         "domain_version": "1.0.0",
-        "filters": {"severity": ["high"]},
+        "filters": {},
         "start_tier": "L2",
     }
     base.update(overrides)
@@ -572,9 +572,10 @@ def test_worker_task_commits_its_own_changes(session, ctx):
     assert status != enums.AGENT_RUN_QUEUED, (
         f"Worker 报告了 {out['status']}，但库里仍是 {status} —— 说明任务没有提交"
     )
-    assert status in (enums.AGENT_RUN_PARTIAL_SUCCESS, enums.AGENT_RUN_FAILED)
-    if status == enums.AGENT_RUN_PARTIAL_SUCCESS:
-        assert metadata and metadata.get("stop_reason") == "model_unavailable"
+    # 空输入走 L0，不应为未使用的模型配置而失败；仍须在独立会话看到完整产物。
+    assert status == enums.AGENT_RUN_COMPLETED
+    assert metadata["tier"] == "L0"
+    assert metadata["rules_only_report"]["kind"] == "rules_only"
 
 
 # ============================================================
@@ -1027,7 +1028,7 @@ def test_mid_check_stops_at_policy_limit_and_keeps_partial_results(session, ctx)
             message="kernel: Out of memory: Kill process 1234",
         ),
     )
-    run_id, _, _ = create_run(runs, _request(project, source))
+    run_id, _, _ = create_run(runs, _request(project, source, start_tier="L3"))
     session.commit()
 
     class _FakeSettings:
@@ -1084,7 +1085,7 @@ def test_mid_check_stops_at_policy_limit_and_keeps_partial_results(session, ctx)
                 session_factory=SessionLocal,
                 run_id=run_id,
                 project_id=project.id,
-                start_tier="L2",
+                start_tier="L3",
             )
     finally:
         reset_policy_store()  # 覆盖是进程内的，别漏给别的测试

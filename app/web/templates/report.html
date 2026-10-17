@@ -37,7 +37,7 @@
 {% block scripts %}
 <script>
 const RUN_ID = {{ run_id }};
-const PROJECT_ID = "{{ project_id }}";
+let PROJECT_ID = {{ project_id | tojson }};
 
 function runApi() { return `/api/runs/${RUN_ID}?project_id=${encodeURIComponent(PROJECT_ID)}`; }
 
@@ -157,6 +157,10 @@ function renderInsight(insight, run) {
           el('td', { text: row.description || '—' }),
         ]));
         evidenceBox.appendChild(table);
+        for (const event of (row.events || [])) {
+          evidenceBox.appendChild(el('pre', {class: 'event-message', text:
+            `#${event.id} · ${fmtTime(event.timestamp)} · ${event.severity}\n${event.message}`}));
+        }
       }
     } catch (error) {
       evidenceBox.appendChild(el('div', { class: 'banner banner-error', text: `加载证据失败：${error.message}` }));
@@ -227,7 +231,26 @@ async function load() {
       `/api/runs/${RUN_ID}/insights?project_id=${encodeURIComponent(PROJECT_ID)}`);
     const list = document.getElementById('insights');
     list.textContent = '';
-    if (!insights.length) {
+    const rules = (run.run_metadata || {}).rules_only_report;
+    if (rules) {
+      list.appendChild(el('div', {class: 'banner banner-info', text: rules.disclaimer}));
+      const stats = rules.statistics || {};
+      const metrics = el('div', {class: 'report-metrics'});
+      for (const [label, value] of [['事件总数', stats.total ?? 0], ['错误事件', stats.error_count ?? 0],
+          ['错误率', `${((stats.error_rate || 0) * 100).toFixed(2)}%`]]) {
+        metrics.appendChild(el('div', {class: 'report-metric'}, [el('span', {class: 'muted', text: label}), el('strong', {text: String(value)})]));
+      }
+      list.appendChild(metrics);
+      list.appendChild(el('p', {class: 'muted', text: `事件时间范围：${fmtTime(stats.time_start)} 至 ${fmtTime(stats.time_end)}`}));
+      if (!stats.total) list.appendChild(el('div', {class: 'banner banner-warn', text: '所选范围内没有事件，请检查数据源、时间窗和过滤条件。'}));
+      const scope = (run.run_metadata || {}).analysis_scope;
+      if (scope) list.appendChild(el('p', {class: 'muted small', text: `分析数据源 #${scope.source_id} · ${fmtTime(scope.start)} 至 ${fmtTime(scope.end)}`}));
+      list.appendChild(el('h3', {text: `事件分组 ${rules.group_count} · 事故归并 ${rules.incident_count}`}));
+      for (const group of (rules.top_groups || [])) {
+        list.appendChild(el('pre', {class: 'event-message', text: `${group.event_count} 条 · ${group.template}`}));
+      }
+    }
+    if (!insights.length && !rules) {
       list.appendChild(el('div', { class: 'empty', text:
         '本 Run 没有产出结论。若状态是「部分成功」或「失败」，请看上方的中断原因。' }));
     } else {
@@ -258,6 +281,13 @@ async function load() {
   }
 }
 
-load();
+async function initialize() {
+  try {
+    const run = await API.get(`/api/runs/${RUN_ID}`);
+    PROJECT_ID = run.project_id;
+    await load();
+  } catch (error) { showError(`加载 Run 失败：${error.message}`); }
+}
+initialize();
 </script>
 {% endblock %}

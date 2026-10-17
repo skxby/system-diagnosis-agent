@@ -7,6 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import field_validator
 
 # .env 相对项目根定位，避免「换个 cwd 就读不到配置」这种坑
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -28,6 +29,9 @@ class Settings(BaseSettings):
 
     # --- 会话 ---
     secret_key: str = "change-me"
+    allow_registration: bool = False
+    cookie_secure: bool = False
+    default_domain_id: str = "computer_monitoring"
 
     # --- 模型等级 → 型号映射 ---
     model_l1: str = ""
@@ -58,6 +62,12 @@ class Settings(BaseSettings):
 
     # --- 运行时数据目录（知识库 confirmed/staging，见修订说明第 2 条）---
     data_dir: str = "./data"
+
+    @field_validator("data_dir")
+    @classmethod
+    def resolve_data_dir(cls, value: str) -> str:
+        path = Path(value)
+        return str(path if path.is_absolute() else PROJECT_ROOT / path)
 
     # --- 预算 ---
     monthly_budget: float = 10.0

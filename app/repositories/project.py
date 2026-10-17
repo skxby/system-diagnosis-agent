@@ -5,8 +5,9 @@ Project 本身即边界，故不按 project_id 过滤 —— 它按 user_id 过�
 
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
+from decimal import Decimal
 
 from app.models.project import Project
 
@@ -41,9 +42,12 @@ class ProjectRepository:
 
         `amount <= 0` 时也照样写回（幂等：写的是同一个值），但不做无谓的加零。
         """
-        project = self.session.get(Project, project_id)
-        if project is None:
+        value = self.session.execute(
+            update(Project).where(Project.id == project_id)
+            .values(budget_used=Project.budget_used + Decimal(str(max(0.0, float(amount)))))
+            .returning(Project.budget_used)
+            .execution_options(synchronize_session="fetch")
+        ).scalar_one_or_none()
+        if value is None:
             raise ValueError(f"Project {project_id} 不存在，拒绝写预算")
-        current = float(project.budget_used or 0.0)
-        project.budget_used = current + max(0.0, float(amount))
-        return float(project.budget_used)
+        return float(value)

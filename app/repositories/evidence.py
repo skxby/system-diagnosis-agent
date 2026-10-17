@@ -37,6 +37,10 @@ class EvidenceRepository:
             ).scalars().all()
         )
 
+    def list_for_insights(self, project_id: int, insight_ids: list[int]) -> list[Evidence]:
+        return list(self.session.scalars(self._scoped(project_id)
+                    .where(Evidence.insight_id.in_(insight_ids)).order_by(Evidence.id)).all())
+
     def add(self, project_id: int, evidence: Evidence) -> Evidence:
         """插入前校验：其 insight 必须属于同一 project。"""
         insight = self.session.get(Insight, evidence.insight_id)

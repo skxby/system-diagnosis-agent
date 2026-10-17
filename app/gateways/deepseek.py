@@ -24,6 +24,7 @@ from app.gateways.base import (
     ModelGateway,
     ModelResult,
     ModelUnavailableError,
+    ModelRequestError,
     StructuredOutputError,
 )
 
@@ -168,14 +169,14 @@ class DeepSeekGateway(ModelGateway):
 
         if response.status_code >= 500:
             raise ModelUnavailableError(
-                f"模型服务返回 {response.status_code}：{response.text[:300]}"
+                f"模型服务返回 {response.status_code}"
             )
         if response.status_code == 429:
-            raise ModelUnavailableError(f"模型服务限流（429）：{response.text[:300]}")
+            raise ModelUnavailableError("模型服务限流（429）")
         if response.status_code >= 400:
             # 4xx 多为输入/配置问题，重试无意义，但仍归入 Gateway 错误族
-            raise ModelUnavailableError(
-                f"模型服务返回 {response.status_code}：{response.text[:300]}"
+            raise ModelRequestError(
+                f"模型服务拒绝请求（HTTP {response.status_code}），请检查凭据和参数"
             )
 
         try:

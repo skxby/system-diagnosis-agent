@@ -27,7 +27,7 @@
 | 等级 | 用途（计划 11 节） | 型号 | 推理档位 | 上下文 |
 |---|---|---|---|---|
 | **L1** | 归类、摘要、简单解释 | `deepseek-flash` | 非思考 | 1M |
-| **L2** | 相关性、多错误归纳 | `deepseek-flash` | 思考（low/medium） | 1M |
+| **L2** | 相关性、多错误归纳 | `deepseek-flash` | 思考（low） | 1M |
 | **L3** | 复杂根因、跨时间簇困难推理 | `deepseek-flash` | 思考（high/max） | 1M |
 
 - 供应商：**DeepSeek 官方 API**，OpenAI 兼容端点。
@@ -68,7 +68,7 @@ MODEL_L3=deepseek-flash
 
 # 推理档位（Gateway 内部消化；L1 关，L2/L3 开）
 MODEL_L1_REASONING=off
-MODEL_L2_REASONING=medium
+MODEL_L2_REASONING=low
 MODEL_L3_REASONING=high
 
 # 成本单价：每百万 tokens；货币单位 1（如 1=CNY）。以下取「闲时价」，高峰时按 2 倍算

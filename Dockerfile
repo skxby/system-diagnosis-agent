@@ -20,8 +20,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # 依赖单独一层：源码改动不会让依赖重装
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.lock.txt ./
+RUN pip install --no-cache-dir -r requirements.lock.txt && pip check
 
 # 再拷源码。注意 .dockerignore 已排除 .env / .credentials.yaml / .venv 等
 COPY . .

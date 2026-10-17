@@ -16,8 +16,48 @@ from collections.abc import Awaitable, Callable
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
+from starlette.responses import JSONResponse
+from urllib.parse import urlsplit
 
 from app.utils.observability import TRACE_ID_HEADER, bind_run_context, new_trace_id
+
+
+class RequestSafetyMiddleware:
+    """在 multipart 解析前限制原始上传体；拒绝跨站浏览器写请求。"""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        headers = dict(scope["headers"])
+        if scope["method"] not in {"GET", "HEAD", "OPTIONS"}:
+            origin = headers.get(b"origin")
+            if (headers.get(b"sec-fetch-site") == b"cross-site" or
+                (origin and urlsplit(origin.decode()).netloc != headers.get(b"host", b"").decode())):
+                return await JSONResponse({"detail": "拒绝跨站写请求"}, status_code=403)(scope, receive, send)
+        if scope["path"].endswith("/upload"):
+            from app.services.upload_service import MAX_UPLOAD_BYTES
+            from starlette.exceptions import HTTPException
+            limit = MAX_UPLOAD_BYTES + 64 * 1024  # 有限的 multipart 头部余量
+            try:
+                length = int(headers.get(b"content-length", b"0"))
+            except ValueError:
+                return await JSONResponse({"detail": "无效 Content-Length"}, status_code=400)(scope, receive, send)
+            if length > limit:
+                return await JSONResponse({"detail": "上传大小超过 10 MiB"}, status_code=413)(scope, receive, send)
+            used = 0
+            original_receive = receive
+
+            async def limited_receive():
+                nonlocal used
+                message = await original_receive()
+                used += len(message.get("body", b""))
+                if used > limit:
+                    raise HTTPException(413, "上传大小超过 10 MiB")
+                return message
+            receive = limited_receive
+        await self.app(scope, receive, send)
 
 
 class TraceIdMiddleware(BaseHTTPMiddleware):

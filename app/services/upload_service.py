@@ -24,6 +24,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
+import hashlib
+from sqlalchemy import text
 
 from sqlalchemy.orm import Session
 
@@ -35,7 +38,7 @@ from app.parsers import get_parser
 from app.repositories.datasource import DataSourceRepository
 from app.repositories.event import EventRepository
 from app.utils.masking import Masker
-from app.utils.timestamps import TimestampUnparseableError, parse_timestamp
+from app.utils.timestamps import TimestampUnparseableError, parse_timestamp, resolve_year_for_month_day, get_zone
 
 #: 上传大小上限（10 MiB）。超限**拒绝**并给明确提示（验收 5）。
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
@@ -138,17 +141,18 @@ class UploadService:
         *,
         uploads_dir: Path,
         domain_registry: DomainRegistry | None = None,
-        domain_id: str = "computer_monitoring",
+        domain_id: str | None = None,
         domain_version: str | None = None,
         max_upload_bytes: int = MAX_UPLOAD_BYTES,
-        default_timezone: str = "Asia/Shanghai",
+        default_timezone: str | None = None,
     ) -> None:
         self.session = session
         self.uploads_dir = Path(uploads_dir)
         self.registry = domain_registry or get_domain_registry()
-        self.domain = self.registry.load(domain_id, domain_version)
+        from app.config import get_settings
+        self.domain = self.registry.load(domain_id or get_settings().default_domain_id, domain_version)
         self.max_upload_bytes = max_upload_bytes
-        self.default_timezone = default_timezone
+        self.default_timezone = default_timezone or get_settings().default_timezone
 
     # ---------- 主流程 ----------
 
@@ -160,15 +164,32 @@ class UploadService:
         filename: str,
         fmt: str,
         data_source_id: int | None = None,
+        mask_ip: bool | None = None,
         now: datetime | None = None,
     ) -> UploadResult:
         raw_bytes = content.encode("utf-8") if isinstance(content, str) else content
         self._enforce_size_limit(raw_bytes)
+        # 同项目同格式的首次上传也要串行，避免并发创建两个来源绕过内容去重。
+        lock_key = int.from_bytes(hashlib.sha256(f"upload:{project_id}:{fmt}".encode()).digest()[:8],
+                                  "big", signed=True)
+        self.session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": lock_key})
 
         data_source, created = self._resolve_data_source(
-            project_id=project_id, fmt=fmt, filename=filename, data_source_id=data_source_id
+            project_id=project_id, fmt=fmt, filename="已脱敏上传文件", data_source_id=data_source_id
         )
         options = mask_options_from_datasource(data_source)
+        if mask_ip is not None:
+            options["mask_ip"] = mask_ip
+        if not options["enabled"]:
+            raise ValueError("上传不允许关闭脱敏；请移除数据源的 mask_disabled 配置")
+        self.session.refresh(data_source, with_for_update=True)
+        digest = hashlib.sha256(raw_bytes + f"\0{fmt}\0{options['mask_ip']}".encode()).hexdigest()
+        uploads = dict((data_source.meta or {}).get("uploads") or {})
+        if digest in uploads:
+            cached = uploads[digest]
+            return UploadResult(data_source_id=data_source.id, created_data_source=False,
+                format=fmt, stored_filename=cached["stored_filename"], events_persisted=0,
+                parse_stats={**cached["parse"], "duplicate": True}, mask_stats=cached["mask"])
 
         # ① 解码（原始内容只存在于内存）
         # ② 脱敏 —— 必须发生在这里，即任何写盘之前
@@ -176,7 +197,8 @@ class UploadService:
             mask_ip=options["mask_ip"],
             enabled=options["enabled"],
         )
-        masked_text = masker.mask(self._decode(raw_bytes))
+        decoded, encoding = self._decode_details(raw_bytes)
+        masked_text = masker.mask(decoded)
 
         # ③ 落盘：写的是脱敏后文本，原文永不落盘（红线 5）
         stored_path = self._store_masked(masked_text, filename, project_id)
@@ -189,6 +211,8 @@ class UploadService:
         persisted, ts_bad = self._persist(project_id, data_source.id, records, now=now)
 
         parse_stats = parser.as_dict()
+        parse_stats["encoding"] = encoding
+        parse_stats["mask_ip"] = options["mask_ip"]
         # 时间戳归一失败的行也要如实计入坏行（红线 4）
         if ts_bad:
             parse_stats["bad_lines"] += ts_bad
@@ -200,6 +224,9 @@ class UploadService:
                 round(parse_stats["bad_lines"] / denominator, 4) if denominator else 0.0
             )
 
+        uploads[digest] = {"stored_filename": stored_path.name,
+                           "parse": parse_stats, "mask": masker.stats.as_dict()}
+        data_source.meta = {**(data_source.meta or {}), "uploads": uploads}
         return UploadResult(
             data_source_id=data_source.id,
             created_data_source=created,
@@ -222,11 +249,19 @@ class UploadService:
 
     @staticmethod
     def _decode(raw_bytes: bytes) -> str:
-        """按 UTF-8 解码，失败则用替换字符（不因编码问题整单失败）。
+        """严格解码 UTF-8/BOM 或 GB18030，无法解码时拒绝上传。"""
+        return UploadService._decode_details(raw_bytes)[0]
 
-        替换字符会把非法字节显式暴露成 `\ufffd`，比静默丢行更容易发现。
-        """
-        return raw_bytes.decode("utf-8", errors="replace")
+    @staticmethod
+    def _decode_details(raw_bytes: bytes) -> tuple[str, str]:
+        if raw_bytes.startswith((b"\xff\xfe", b"\xfe\xff")):
+            return raw_bytes.decode("utf-16"), "utf-16"
+        for encoding in ("utf-8-sig", "gb18030"):
+            try:
+                return raw_bytes.decode(encoding), encoding
+            except UnicodeDecodeError:
+                continue
+        raise ValueError("无法解码日志，请转换为 UTF-8 后上传")
 
     def _resolve_data_source(
         self, *, project_id: int, fmt: str, filename: str, data_source_id: int | None
@@ -263,21 +298,17 @@ class UploadService:
     def _store_masked(self, masked_text: str, filename: str, project_id: int) -> Path:
         """保存脱敏后文件。
 
-        目录结构 `uploads/<project_id>/`，文件名做安全化处理：
-        只保留基名并替换路径分隔符，防止 `../../` 之类的路径穿越。
+        目录结构 uploads/<project_id>/；存储名使用时间戳与 UUID，不保留原始文件名。
         """
         target_dir = self.uploads_dir / str(project_id)
         target_dir.mkdir(parents=True, exist_ok=True)
 
-        safe_name = Path(filename).name.replace("\\", "_").replace("/", "_")
-        if not safe_name or safe_name in (".", ".."):
-            safe_name = "upload.log"
         # 时间戳前缀避免同名覆盖，同时保留可读性
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
-        path = target_dir / f"{stamp}_{safe_name}"
+        path = target_dir / f"{stamp}_{uuid4().hex}.log"
 
         # 顺序关键：这里写入的已经是 masked_text
-        path.write_text(masked_text, encoding="utf-8")
+        path.write_bytes(masked_text.encode("utf-8"))
         return path
 
     def _persist(
@@ -297,10 +328,16 @@ class UploadService:
         for record in records:
             event: Any = record.event
             try:
+                raw_timestamp = event.timestamp
+                raw = getattr(event, "raw", None) or {}
+                if isinstance(raw_timestamp, datetime) and raw.get("ts_has_year") is False:
+                    year = resolve_year_for_month_day(raw_timestamp.month, raw_timestamp.day,
+                        now=(now or datetime.now(timezone.utc)).astimezone(get_zone(self.default_timezone)))
+                    raw_timestamp = raw_timestamp.replace(year=year)
                 ts = parse_timestamp(
-                    event.timestamp, default_timezone=self.default_timezone, now=now
+                    raw_timestamp, default_timezone=self.default_timezone, now=now
                 )
-            except TimestampUnparseableError:
+            except (TimestampUnparseableError, ValueError):
                 # 不静默用 now() 替代（计划第 540 行）
                 timestamp_bad += 1
                 continue

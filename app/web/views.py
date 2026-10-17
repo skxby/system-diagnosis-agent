@@ -14,12 +14,17 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app.web import get_templates
+from app.web import STATIC_DIR
+import hashlib
 
 router = APIRouter()
 templates = get_templates()
 
 
 def _render(request: Request, template: str, **context: object) -> HTMLResponse:
+    context["asset_version"] = hashlib.sha256(b"".join(
+        (STATIC_DIR / name).read_bytes() for name in ("app.js", "app.css")
+    )).hexdigest()[:12]
     return templates.TemplateResponse(request, template, context)
 
 

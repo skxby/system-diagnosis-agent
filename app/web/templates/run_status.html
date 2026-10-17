@@ -40,7 +40,7 @@
 {% block scripts %}
 <script>
 const RUN_ID = {{ run_id }};
-const PROJECT_ID = "{{ project_id }}";
+let PROJECT_ID = {{ project_id | tojson }};
 let timer = null;
 
 function apiPath() {
@@ -183,7 +183,14 @@ function showInfo(message) {
 }
 
 document.getElementById('report-btn').disabled = false;
-refresh();
-timer = setInterval(refresh, 3000);
+async function initialize() {
+  try {
+    const run = await API.get(`/api/runs/${RUN_ID}`);
+    PROJECT_ID = run.project_id;
+    await refresh();
+    timer = setInterval(() => { if (!document.hidden) refresh(); }, 3000);
+  } catch (error) { showError(`加载 Run 失败：${error.message}`); }
+}
+initialize();
 </script>
 {% endblock %}

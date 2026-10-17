@@ -255,8 +255,11 @@ def call_with_fallback(
     （例如预算耗尽、认证失败——降级重试没有意义，只是多花钱）。
     """
     attempts: list[FallbackAttempt] = []
+    ceiling = 4
 
     for tier in downgrade_ladder(start_tier):
+        if int(tier[-1]) >= ceiling:
+            continue
         outcome = call_with_retry(
             lambda t=tier: attempt_tier(t),
             policy=retry_policy,
@@ -276,6 +279,9 @@ def call_with_fallback(
             )
 
         kind = classify_error(outcome.last_error) if outcome.last_error else ErrorKind.UNKNOWN
+        actual_tier = getattr(outcome.last_error, "tier_used", tier)
+        if actual_tier in MODEL_TIERS:
+            ceiling = min(ceiling, int(actual_tier[-1]))
         # `StopExecution` 自带计划第 660 行的 stop_reason 词汇
         # （budget_exceeded / token_limit / runtime_limit / call_limit）。
         # 若一律用错误分类（"budget"）当 stop_reason，就和计划里的取值对不上：

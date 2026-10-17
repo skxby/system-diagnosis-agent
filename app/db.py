@@ -17,6 +17,7 @@ engine = create_engine(
     settings.database_url,
     # 连接被中间层掐断后自动重建，避免长跑的 worker 拿到死连接
     pool_pre_ping=True,
+    connect_args={"connect_timeout": 5},
     # 池耗尽时最多等 30s，然后明确报错，而不是无限挂住
     pool_timeout=30,
 )

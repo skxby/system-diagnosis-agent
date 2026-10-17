@@ -21,8 +21,9 @@
     <button class="primary" id="upload-btn">上传并解析</button>
   </div>
   <p class="muted small">
-    上传后**先脱敏再落盘**：磁盘上只有脱敏后的版本，原文不持久化。
+    上传后<strong>先脱敏再落盘</strong>：磁盘上只有脱敏后的版本，原文不持久化。
   </p>
+  <label class="row"><input type="checkbox" id="mask-ip">同时脱敏 IP 地址（默认保留，供排障定位）</label>
   <div id="upload-result" class="mt"></div>
 </div>
 
@@ -42,12 +43,25 @@
       <input type="datetime-local" id="time-end">
     </label>
   </div>
+  <div class="row mt">
+    <label>严重度<select id="severity"><option value="">全部</option><option value="high">high</option><option value="medium">medium</option><option value="low">low</option></select></label>
+    <label>事件类型<select id="event-type"><option value="">全部</option><option value="log">log</option><option value="metric">metric</option></select></label>
+    <label>消息关键词<input id="keyword" maxlength="200" placeholder="精确包含的文本"></label>
+  </div>
   <div id="analyze-result" class="mt"></div>
 </div>
 
 <div class="card">
   <h2>③ 分析记录</h2>
   <div id="runs"></div>
+</div>
+<div class="card">
+  <details id="catalog">
+    <summary>事件分组与事故记忆库</summary>
+    <p class="muted small">分组由模板和时间窗计算。事故是启发式归并，不代表根因判定。</p>
+    <h3>事件分组</h3><div id="groups"></div>
+    <h3>事故归并</h3><div id="incidents"></div>
+  </details>
 </div>
 {% endblock %}
 
@@ -123,6 +137,7 @@ document.getElementById('upload-btn').addEventListener('click', async () => {
   const form = new FormData();
   form.append('file', input.files[0]);
   form.append('fmt', document.getElementById('format').value);
+  form.append('mask_ip', document.getElementById('mask-ip').checked);
 
   const button = document.getElementById('upload-btn');
   button.disabled = true;
@@ -148,7 +163,13 @@ document.getElementById('analyze-btn').addEventListener('click', async () => {
   const sourceId = Number(document.getElementById('data-source').value || 0);
   if (!sourceId) { showError('请先上传日志或选择一个数据源'); return; }
 
-  const payload = { data_source_id: sourceId };
+  const payload = { data_source_id: sourceId, filters: {} };
+  const severity = document.getElementById('severity').value;
+  const eventType = document.getElementById('event-type').value;
+  const keyword = document.getElementById('keyword').value;
+  if (severity) payload.filters.severity = [severity];
+  if (eventType) payload.filters.event_type = [eventType];
+  if (keyword) payload.filters.keyword = keyword;
   const start = toIso(document.getElementById('time-start').value);
   const end = toIso(document.getElementById('time-end').value);
   if (start || end) { payload.time_range = { start, end }; }
@@ -175,11 +196,44 @@ document.getElementById('analyze-btn').addEventListener('click', async () => {
 async function loadRuns() {
   const container = document.getElementById('runs');
   container.textContent = '';
-  // 没有"列出项目下所有 Run"的端点，这里用 GET /api/runs/{id} 逐个查不现实；
-  // V1 的做法是刚创建的 Run 直接跳状态页，这里只放最近一次操作的入口。
-  container.appendChild(el('div', { class: 'empty',
-    text: '发起分析后，从上方的链接进入 Run 状态页；状态页会显示阶段进度与成本。' }));
+  try {
+    const runs = await API.get(`/api/projects/${PROJECT_ID}/runs?limit=100`);
+    if (!runs.length) container.appendChild(el('div', {class: 'empty', text: '还没有分析记录。上传日志后，点击「开始分析」。'}));
+    for (const run of runs) {
+      container.appendChild(el('div', {class: 'list-item'}, [
+        el('div', {}, [el('a', {href: `/runs/${run.id}`, text: `Run #${run.id}`}),
+          el('span', {class: 'muted small', text: ` · ${fmtTime(run.started_at)} · ${fmtCost(run.cost_actual)}`})]),
+        statusPill(run.status), el('a', {href: `/report/${run.id}`, text: '查看报告 →'})]));
+    }
+  } catch (error) { showError(`加载分析历史失败：${error.message}`); }
 }
+
+document.getElementById('catalog').addEventListener('toggle', async (event) => {
+  if (!event.target.open) return;
+  try {
+    const groups = await API.get(`/api/projects/${PROJECT_ID}/groups`);
+    const incidents = await API.get(`/api/projects/${PROJECT_ID}/incidents`);
+    const groupsBox = document.getElementById('groups'); groupsBox.textContent = '';
+    const incidentsBox = document.getElementById('incidents'); incidentsBox.textContent = '';
+    if (!groups.length) groupsBox.appendChild(el('p', {class: 'muted', text: '还没有分组，完成分析后可查看。'}));
+    for (const group of groups) {
+      const details = el('details', {class: 'event-message'}, [el('summary', {text: `#${group.id} · ${group.event_count} 条 · ${group.template}`})]);
+      details.addEventListener('toggle', async () => {
+        if (!details.open || details.dataset.loaded) return;
+        try {
+          const events = await API.get(`/api/projects/${PROJECT_ID}/groups/${group.id}/events`);
+          for (const item of events) details.appendChild(el('pre', {class: 'event-message', text: `#${item.id} · ${fmtTime(item.timestamp)}\n${item.message}`}));
+          details.dataset.loaded = '1';
+        } catch (error) { showError(`加载分组事件失败：${error.message}`); }
+      });
+      groupsBox.appendChild(details);
+    }
+    if (!incidents.length) incidentsBox.appendChild(el('p', {class: 'muted', text: '还没有事故归并记录。'}));
+    for (const incident of incidents) incidentsBox.appendChild(el('div', {class: 'list-item'}, [
+      el('span', {text: `#${incident.id} · ${incident.title} · 分组 ${(incident.group_ids || []).join(', ')}`}),
+      incident.source_run_id ? el('a', {href: `/report/${incident.source_run_id}`, text: '来源报告 →'}) : null]));
+  } catch (error) { showError(`加载分组与事故失败：${error.message}`); }
+});
 
 loadProject();
 loadDataSources();
