@@ -26,6 +26,7 @@ V1 是个人全栈、单领域、**只读**的日志分析 Runtime：上传日�
 | `SECURITY.md` | 要报安全类问题，或想知道"哪些数据会离开本机 / 会发给模型供应商" |
 | `docs/ui-guide.md` / `docs/api.md` | 网页流程与接口约定 |
 | `docs/architecture.md` / `docs/limitations.md` | 当前接线、数据边界与尚未实现能力 |
+| `docs/async-runtime-2026-10-22.md` | 异步上传、监督器、独立 beat 与本轮证据 |
 | `docs/runbook.md` / `docs/audit-2026-10-17.md` | 运维处置、审计核实与验证证据 |
 | `.dsh/skills/*/SKILL.md` | 要按既有节奏做加表、验收、提交、成本核算等固定动作 |
 
@@ -105,8 +106,10 @@ logagent-postgres   Up (healthy)
 logagent-redis      Up (healthy)
 logagent-migrate    Exited (0)      ← 迁移跑完即退出，这是正常的
 logagent-web        Up (healthy)
-logagent-worker     Up
-logagent-beat       Up
+logagent-worker                Up (healthy)
+logagent-upload-worker-1       Up (healthy)
+logagent-maintenance-worker-1  Up (healthy)
+logagent-beat                  Up (healthy)
 ```
 
 浏览器打开 **http://127.0.0.1:8000** 。
@@ -121,7 +124,7 @@ logagent-beat       Up
 1. **登录** —— 首次使用点「首次使用？注册这个邮箱」，用同一个邮箱 + 口令即可。
 2. **建项目** —— 项目是数据边界，所有日志与结论都归属某个项目。
 3. **上传日志** —— 选 `.txt`（syslog / log4j / Apache error 三类行结构）或 `.jsonl`（逐行 JSON）。
-   上传后页面会显示**解析统计**（总行 / 成功 / 坏行 / 跳过 / 合并）与**脱敏计数**。
+   上传先返回 202 和任务 ID，页面轮询后台任务；刷新后可恢复最近进度。解析和入库完成后显示**解析统计**（总行 / 成功 / 坏行 / 跳过 / 合并）与**脱敏计数**。
    坏行会列出样本 —— 不会被静默丢弃。
    > 边界提示：**Web access 平文日志不属本领域**（那是"站点访问"语义，不是"主机/进程监控"），
    > 整批会计入坏行 —— 这是有意为之，负样本见 `logs/nginx_plain.log` 与 `logs/README.md`。
@@ -175,6 +178,11 @@ logagent-beat       Up
 | `MODEL_PEAK_PRICE_MULTIPLIER` | `2` | 高峰时段倍数（窗口＝工作日 9–12、14–18 点，按 `DEFAULT_TIMEZONE`）；单价按闲时价填，填 1 表示不区分峰谷 |
 | `MONTHLY_BUDGET` / `DEFAULT_RUN_MAX_COST` | `10` / `0.30` | 月度预算 / 单次 Run 上限，货币单位统一为**人民币元**；`0` 表示该项不设上限（单次为 `0` 则是"不许花钱"） |
 | `ZOMBIE_REAP_INTERVAL_SECONDS` | `60` | 僵尸 Run 的周期扫描间隔（beat 任务）。心跳超时是 300s，扫描必须比它勤 |
+| `WORKER_TASK_TIMEOUT_SECONDS` | `600` | 独立监督器的单任务墙钟期限，到期终止并重启子进程树 |
+| `WORKER_STARTUP_TIMEOUT_SECONDS` | `60` | 子 Worker 启动期限 |
+| `WORKER_PROBE_INTERVAL_SECONDS` / `WORKER_PROBE_TIMEOUT_SECONDS` | `30` / `20` | 空闲队列消费探针的间隔与期限 |
+| `UPLOAD_QUEUE_TIMEOUT_SECONDS` | `1800` | 长期排队上传的回收期限 |
+| `UPLOAD_QUEUE` | `uploads` | 宿主机可配置；Compose 统一使用 uploads |
 | `DATA_DIR` | `./data` | 运行时数据（知识库 confirmed/staging）；compose 里是 `/app/data`（卷） |
 | `DEFAULT_TIMEZONE` | `Asia/Shanghai` | 日志时间戳缺时区时按它解析，再转 UTC 存库 |
 
@@ -224,13 +232,13 @@ python -m venv .venv
 alembic upgrade head
 pytest -q                                          # 单测 + 集成测试
 uvicorn app.main:app --reload                      # http://127.0.0.1:8000
-celery -A app.celery_app worker -P solo -l info    # Windows 必须 -P solo
-celery -A app.celery_app worker -P solo -l info -Q maintenance -B   # 僵尸回收（beat + 维护队列）
+python -m app.worker_supervisor --role analysis --queues celery
+python -m app.worker_supervisor --role uploads --queues uploads
+python -m app.worker_supervisor --role maintenance --queues maintenance
+celery -A app.celery_app beat --scheduler app.beat_scheduler:HealthScheduler --max-interval 5 --schedule data/celerybeat-schedule
 ```
 
-> 第三个进程不是可选的：**僵尸 Run 的回收靠它**。分析 worker 挂了正是它要处理的场景，
-> 所以它必须独立于分析 worker（走 `maintenance` 队列），否则回收任务会和分析任务
-> 一起被卡住 —— compose 里这件事由 `logagent-beat` 容器负责。
+> Web、三个受监督的 solo Worker 和独立 beat 分别运行。分析卡死不会堵塞上传或维护队列；父监督进程按任务期限停止旧进程树、记明失败并重启。`/healthz/workers` 同时验证三个消费者和调度循环，单纯 Up 不是就绪证据。
 
 ### 跑 Golden Set
 

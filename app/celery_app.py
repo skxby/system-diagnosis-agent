@@ -30,7 +30,7 @@ celery_app = Celery(
     "logagent",
     broker=settings.redis_url,
     backend=settings.redis_url,
-    include=["app.tasks.health", "app.tasks.analysis", "app.tasks.maintenance"],
+    include=["app.tasks.health", "app.tasks.analysis", "app.tasks.maintenance", "app.tasks.upload"],
 )
 
 celery_app.conf.update(
@@ -46,6 +46,9 @@ celery_app.conf.update(
     result_expires=3600,
     broker_connection_retry_on_startup=True,
     task_track_started=True,
+    broker_connection_timeout=3,
+    broker_transport_options={"socket_connect_timeout": 3, "socket_timeout": 3},
+    redis_socket_timeout=3,
     # 僵尸 Run 回收（阶段 08 验收「手动 kill Worker 后僵尸 Run 被回收」）。
     #
     # 这条 schedule 此前**根本不存在** —— beat 容器一直在空转，
@@ -62,12 +65,16 @@ celery_app.conf.update(
     # 第一版把它发到默认队列（和分折任务同一个），结果真机复验当场打脸：
     # 分析 Worker 一被冻结，回收任务就跟着排在队列里没人消费 ——
     # 而"分析 Worker 死了"恰恰是它唯一要处理的场景。**救火队不能住在消防站里。**
-    # 现在 `maintenance` 队列由 beat 容器内嵌的 worker 消费（`-Q maintenance -B`），
-    # 与 web/worker 完全独立。
+    # maintenance 由独立受监督的 Worker 消费，beat 只负责调度。
     task_routes={
+        "app.tasks.upload.*": {"queue": settings.upload_queue},
         "app.tasks.maintenance.*": {"queue": "maintenance"},
     },
 )
+
+# Supervisor 所需的是任务边界通知，不是被任务卡住的 remote-control ping。
+from app.worker_lifecycle import install_signals
+install_signals()
 
 
 @setup_logging.connect

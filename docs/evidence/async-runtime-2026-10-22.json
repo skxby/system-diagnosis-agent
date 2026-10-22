@@ -1,0 +1,56 @@
+{
+  "tests": {
+    "tests": 828,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 3,
+    "passed": 825
+  },
+  "process_faults": [
+    {
+      "kind": "upload",
+      "frozen_pid": 40936,
+      "old_process_dead": true,
+      "restarts": 1,
+      "probe_after_restart": 2,
+      "terminal": "failed",
+      "rollback_verified": true
+    },
+    {
+      "kind": "analysis",
+      "frozen_pid": 24528,
+      "old_process_dead": true,
+      "restarts": 1,
+      "probe_after_restart": 2,
+      "terminal": "timeout",
+      "rollback_verified": false
+    }
+  ],
+  "linux_container": {
+    "health": {
+      "status": "ok",
+      "checks": {
+        "analysis": true,
+        "uploads": true,
+        "maintenance": true,
+        "beat": true
+      }
+    },
+    "upload_http": 202,
+    "events": 60,
+    "analysis": "completed",
+    "model_cost": 0,
+    "frozen_pid_dead": true,
+    "restarts": 1,
+    "reason": "worker_probe_timeout",
+    "healthy_after_restart": true
+  },
+  "browser": {
+    "upload_http": 202,
+    "restored_after_reload": true,
+    "analysis_completed": true,
+    "javascript_errors": []
+  },
+  "tables_and_agent_run_transitions_changed": false,
+  "known_configured_secret_history_matches": 0
+}

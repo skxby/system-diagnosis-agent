@@ -58,7 +58,10 @@ set /a tries=0
 :wait
 set /a tries+=1
 curl --fail -s -o nul --max-time 8 http://127.0.0.1:8000/healthz/deps
+if errorlevel 1 goto notready
+curl --fail -s -o nul --max-time 8 http://127.0.0.1:8000/healthz/workers
 if not errorlevel 1 goto ready
+:notready
 if %tries% geq 90 goto timeout
 timeout /t 2 /nobreak >nul
 goto wait

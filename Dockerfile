@@ -23,8 +23,10 @@ WORKDIR /app
 COPY requirements.lock.txt ./
 RUN pip install --no-cache-dir -r requirements.lock.txt && pip check
 
-# 再拷源码。注意 .dockerignore 已排除 .env / .credentials.yaml / .venv 等
-COPY . .
+# 运行源码使用允许清单，工作区其他未跟踪资料不会进入镜像层。
+COPY app/ ./app/
+COPY migrations/ ./migrations/
+COPY alembic.ini .env.example README.md ./
 
 # 以非 root 运行：容器逃逸时的影响面更小
 RUN useradd --create-home --uid 10001 appuser \

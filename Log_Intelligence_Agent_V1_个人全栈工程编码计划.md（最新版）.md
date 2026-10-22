@@ -516,7 +516,7 @@ Upload
   → Parser（TXT / JSONL）
   → Domain.normalize
   → 批量写入 Event
-  → 返回解析统计（总行 / 成功 / 坏行 / 脱敏计数）
+  → 后台任务保存解析统计（总行 / 成功 / 坏行 / 脱敏计数），通过查询接口返回
 ```
 
 **DataSource 与上传的关系（V1 简化口径）**：
@@ -561,7 +561,7 @@ NER 人名/机构识别：后移，V1 不做
 - 误伤与漏检都要记录计数，写入 Run 元数据，供后续调整规则。
 
 **验收**：
-1. 上传 TXT / JSONL 能解析为事件入库，响应含解析统计；
+1. 上传 TXT / JSONL 返回 202 + job_id，后台解析入库；任务查询响应含解析统计；
 2. 含邮箱 / 密钥的内容在**落盘文件和数据库**中都已被替换；磁盘上找不到原文敏感值；
 3. 坏行 / 无法识别的时间戳被计数并明确报告，不静默丢弃；
 4. 未带 data_source_id 的上传能自动建 / 复用 DataSource；
@@ -863,7 +863,8 @@ POST /api/register、POST /api/login（自用可省略注册页）
 POST /api/projects
 GET  /api/projects
 POST /api/projects/{id}/data-sources
-POST /api/projects/{id}/upload            # 上传日志（可带 data_source_id；触发脱敏+解析）
+POST /api/projects/{id}/upload            # 内存脱敏与安全文件排队，返回 202 + job_id
+GET  /api/projects/{id}/uploads/{job_id}  # 后台解析进度与统计
 POST /api/projects/{id}/analysis-runs     # 创建分析，立即返回 run_id + queued
 GET  /api/runs/{id}                       # 状态、进度、成本
 GET  /api/runs/{id}/insights

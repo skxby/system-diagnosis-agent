@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import http.cookiejar
 import json
+from upload_polling import wait_upload
 import os
 import pathlib
 import secrets
@@ -148,7 +149,9 @@ def _new_project_with_upload(token: str, name: str) -> tuple[int, int]:
     req.add_header("Authorization", "Bearer " + token)
     req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
     with OPENER.open(req, timeout=180) as response:
-        up = json.loads(response.read() or b"{}")
+        code, up = wait_upload(BASE, pid, token, response.status, json.loads(response.read() or b"{}"))
+        if code != 200:
+            raise RuntimeError(f"上传解析失败：{up}")
     return pid, int(up["data_source_id"])
 
 
@@ -405,7 +408,9 @@ def l1_sample() -> int:
     req.add_header("Authorization", "Bearer " + token)
     req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
     with OPENER.open(req, timeout=180) as response:
-        up = json.loads(response.read() or b"{}")
+        code, up = wait_upload(BASE, pid, token, response.status, json.loads(response.read() or b"{}"))
+        if code != 200:
+            raise RuntimeError(f"上传解析失败：{up}")
 
     _, created = call(
         "POST",

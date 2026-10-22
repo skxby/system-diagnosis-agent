@@ -18,6 +18,7 @@
 | 要核对某阶段的验收标准 | `Log_Intelligence_Agent_V1_个人全栈工程编码计划.md（最新版）.md` |
 | 想把它跑起来 / 用页面走一遍 | `README.md` |
 | **要判断"某功能真机上到底生效没有"** | `阶段验收表-真机口径.md` + `真机核验报告-2026-09-24.md` |
+| 异步上传 / Worker 监督 | `docs/async-runtime-2026-10-22.md` |
 | 核对当前审计修复与剩余边界 | `docs/audit-2026-10-17.md` + `docs/architecture.md` + `docs/limitations.md` |
 | 改 Parser / 脱敏规则 | `logs/README.md`（真实语料、基线、已知误伤） |
 | 固定动作（加表/验收/提交/成本/评测） | `.dsh/skills/*/SKILL.md` |
@@ -34,12 +35,14 @@
 
 ```bash
 docker compose up -d postgres redis          # 只起基础设施
-.venv/Scripts/python.exe -m pip install -r requirements.txt   # Windows；无 pyproject，别用 pip install -e ".[dev]"
+.venv/Scripts/python.exe -m pip install -r requirements.lock.txt   # Windows；无 pyproject，别用 pip install -e ".[dev]"
 alembic upgrade head
 pytest -q
 uvicorn app.main:app --reload                # /healthz /healthz/deps /docs
-celery -A app.celery_app worker -P solo -l info
-celery -A app.celery_app worker -P solo -l info -Q maintenance -B   # 僵尸回收（beat + 专用队列）
+python -m app.worker_supervisor --role analysis --queues celery
+python -m app.worker_supervisor --role uploads --queues uploads
+python -m app.worker_supervisor --role maintenance --queues maintenance
+celery -A app.celery_app beat --scheduler app.beat_scheduler:HealthScheduler --max-interval 5 --schedule data/celerybeat-schedule
 ```
 
 最省事的路径是 `docker compose up -d`（README 第 2 节），本机不需要装 Python。

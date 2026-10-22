@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import http.cookiejar
 import json
+from upload_polling import wait_upload
 import os
 import pathlib
 import secrets
@@ -147,7 +148,9 @@ def monthly_e2e() -> None:
     req.add_header("Authorization", "Bearer " + token)
     req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
     with OPENER.open(req, timeout=180) as response:
-        up = json.loads(response.read() or b"{}")
+        code, up = wait_upload(BASE, pid, token, response.status, json.loads(response.read() or b"{}"))
+        if code != 200:
+            raise RuntimeError(f"上传解析失败：{up}")
 
     status, created = call(
         "POST",

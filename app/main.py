@@ -95,3 +95,12 @@ def healthz_deps() -> JSONResponse:
         status_code=200 if healthy else 503,
         content={"status": "ok" if healthy else "degraded", "checks": checks},
     )
+
+
+@app.get("/healthz/workers")
+def healthz_workers() -> JSONResponse:
+    from app.worker_supervisor import healthy
+    checks = {role: healthy(role) for role in ("analysis", "uploads", "maintenance", "beat")}
+    ready = all(checks.values())
+    return JSONResponse(status_code=200 if ready else 503,
+                        content={"status": "ok" if ready else "degraded", "checks": checks})

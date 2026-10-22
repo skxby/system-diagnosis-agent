@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import http.cookiejar
 import json
+from upload_polling import wait_upload
 import os
 import pathlib
 import secrets
@@ -103,7 +104,7 @@ def upload(project_id: int, path: pathlib.Path, fmt: str, token: str, *, source_
     req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
     try:
         with OPENER.open(req, timeout=300) as response:
-            return response.status, json.loads(response.read() or b"{}")
+            return wait_upload(BASE, project_id, token, response.status, json.loads(response.read() or b"{}"))
     except urllib.error.HTTPError as exc:
         raw = exc.read()
         try:

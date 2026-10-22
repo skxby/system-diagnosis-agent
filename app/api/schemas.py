@@ -113,6 +113,13 @@ class CreateDataSourceRequest(StrictModel):
     location: str = Field(default="", max_length=1024)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("metadata")
+    @classmethod
+    def no_runtime_fields(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if {"uploads", "upload_jobs"} & value.keys():
+            raise ValueError("uploads / upload_jobs 是服务端保留字段")
+        return value
+
 
 class DataSourceResponse(StrictModel):
     id: int

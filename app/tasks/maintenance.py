@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from typing import Any
+from sqlalchemy.orm import Session
 
 from app.analysis.heartbeat import DEFAULT_HEARTBEAT_TIMEOUT_SECONDS
 from app.celery_app import celery_app
@@ -45,16 +46,43 @@ def reap_zombie_runs(*, timeout_seconds: int | None = None) -> dict[str, Any]:
         reclaimed = runs.reclaim_zombies(timeout_seconds=timeout)
         # beat 任务的写入必须自己提交：没人替它管会话。
         session.commit()
+        uploads_reclaimed = reclaim_uploads(session)
+        session.commit()
         logger.info(
             "zombie_runs_reclaimed",
             count=len(reclaimed),
             run_ids=reclaimed,
             timeout_seconds=timeout,
         )
-        return {"reclaimed": len(reclaimed), "run_ids": reclaimed, "timeout_seconds": timeout}
+        return {"reclaimed": len(reclaimed), "run_ids": reclaimed, "timeout_seconds": timeout,
+                "uploads_reclaimed": uploads_reclaimed}
     except Exception as exc:  # noqa: BLE001 - 周期任务失败不能让 beat 挂掉
         session.rollback()
         logger.error("zombie_reap_failed", error=f"{type(exc).__name__}: {exc}")
         raise
     finally:
         session.close()
+
+
+def reclaim_uploads(session: Session) -> int:
+    from datetime import datetime, timezone
+    from sqlalchemy import select
+    from app.models.datasource import DataSource
+    from app.repositories.upload_job import UploadJobRepository
+    from app.config import get_settings
+    settings = get_settings()
+    now = datetime.now(timezone.utc)
+    repo = UploadJobRepository(session)
+    count = 0
+    for source in session.scalars(select(DataSource).where(DataSource.meta.op("?")("upload_jobs"))):
+        for job in list((source.meta or {}).get("upload_jobs", {}).values()):
+            if job["status"] not in {"queued", "running"}:
+                continue
+            start = job.get("started_at") or job["created_at"]
+            timeout = settings.upload_queue_timeout_seconds if job["status"] == "queued" else settings.worker_task_timeout_seconds + 60
+            if (now - datetime.fromisoformat(start)).total_seconds() > timeout:
+                result = repo.update(source.project_id, source.id, job["job_id"],
+                    {"status": "failed", "error": "上传排队或执行超时，请重试", "finished_at": now.isoformat()},
+                    expected={job["status"]})
+                count += int(result["status"] == "failed")
+    return count

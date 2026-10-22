@@ -143,14 +143,41 @@ document.getElementById('upload-btn').addEventListener('click', async () => {
   button.disabled = true;
   try {
     const result = await API.upload(`/api/projects/${PROJECT_ID}/upload`, form);
-    renderUploadResult(result);
-    await loadDataSources();
+    await watchUpload(result);
   } catch (error) {
     showError(`上传失败：${error.message}`);
   } finally {
     button.disabled = false;
   }
 });
+
+async function watchUpload(job) {
+  const box = document.getElementById('upload-result');
+  document.getElementById('analyze-btn').disabled = true;
+  try {
+    while (['queued', 'running'].includes(job.status)) {
+      box.textContent = job.status === 'queued' ? '文件已安全接收，正在排队解析…' : '正在后台解析与入库，可以离开页面，稍后会显示结果。';
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      job = await API.get(`/api/projects/${PROJECT_ID}/uploads/${job.job_id}`);
+    }
+    if (job.status === 'completed') renderUploadResult(job);
+    else {
+      box.textContent = job.error || '后台上传解析失败';
+      box.appendChild(el('button', {text: '重试解析', onclick: async () => {
+        try { await watchUpload(await API.post(`/api/projects/${PROJECT_ID}/uploads/${job.job_id}/retry`)); }
+        catch (error) { showError(error.message); }
+      }}));
+    }
+    await loadDataSources();
+  } finally { document.getElementById('analyze-btn').disabled = false; }
+}
+
+async function restoreUpload() {
+  try {
+    const jobs = await API.get(`/api/projects/${PROJECT_ID}/uploads`);
+    if (jobs.length) await watchUpload(jobs[0]);
+  } catch (error) { showError(`加载上传进度失败：${error.message}`); }
+}
 
 function toIso(value) {
   if (!value) return null;
@@ -235,6 +262,7 @@ document.getElementById('catalog').addEventListener('toggle', async (event) => {
   } catch (error) { showError(`加载分组与事故失败：${error.message}`); }
 });
 
+restoreUpload();
 loadProject();
 loadDataSources();
 loadRuns();

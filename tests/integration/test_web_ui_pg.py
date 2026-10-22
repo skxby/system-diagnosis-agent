@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from unittest.mock import patch
 
 import pytest
+from tests.upload_client import upload_and_wait
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
@@ -180,7 +181,7 @@ def test_full_flow_over_http_without_touching_a_terminal(client: TestClient):
     project_id = _project(client, headers)
 
     # ① 上传（页面上的"上传并解析"按钮做的就是这件事）
-    upload = client.post(
+    upload = upload_and_wait(client,
         f"/api/projects/{project_id}/upload",
         files={"file": ("syslog.txt",
                         b"Jun 14 15:16:01 combo kernel: Out of memory: Kill process 1234\n",

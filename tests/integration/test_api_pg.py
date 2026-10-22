@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from unittest.mock import patch
 
 import pytest
+from tests.upload_client import upload_and_wait
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
@@ -669,7 +670,7 @@ def test_upload_persists_events_and_returns_stats(client: TestClient):
         b"Jun 14 15:16:01 combo sshd(pam_unix)[19939]: authentication failure rhost=218.188.2.4\n"
         b"Jun 14 15:16:02 combo kernel: contact ops@example.com for help\n"
     )
-    response = client.post(
+    response = upload_and_wait(client,
         f"/api/projects/{project_id}/upload",
         files={"file": ("syslog.txt", content, "text/plain")},
         data={"fmt": "txt"},
@@ -687,7 +688,7 @@ def test_upload_persists_events_and_returns_stats(client: TestClient):
 def test_upload_rejects_unsupported_format(client: TestClient):
     headers = _register(client)
     project_id = _make_project(client, headers)
-    response = client.post(
+    response = upload_and_wait(client,
         f"/api/projects/{project_id}/upload",
         files={"file": ("a.csv", b"a,b,c\n", "text/csv")},
         data={"fmt": "csv"},
@@ -700,7 +701,7 @@ def test_upload_to_another_project_is_refused(client: TestClient):
     owner = _register(client)
     intruder = _register(client)
     project_id = _make_project(client, owner)
-    response = client.post(
+    response = upload_and_wait(client,
         f"/api/projects/{project_id}/upload",
         files={"file": ("a.txt", b"Jun 14 15:16:01 h a[1]: x\n", "text/plain")},
         data={"fmt": "txt"},
@@ -777,7 +778,7 @@ def test_run_creation_commits_before_dispatching(client: TestClient):
         b"Jun 14 15:16:01 combo kernel: Out of memory: Kill process 1234 (java)\n"
         b"Jun 14 15:16:02 combo kernel: segfault at 0 ip 00007f\n"
     )
-    upload = client.post(
+    upload = upload_and_wait(client,
         f"/api/projects/{project_id}/upload",
         files={"file": ("syslog.txt", content, "text/plain")},
         data={"fmt": "txt"},

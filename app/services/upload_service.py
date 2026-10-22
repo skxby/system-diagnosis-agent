@@ -5,6 +5,7 @@ Upload
   → 读取到内存（流式分块，限制大小）
   → 脱敏（正则替换，发生在写磁盘之前）      ← 红线 5
   → 保存「脱敏后」文件到 uploads/（原始文件不持久化）
+  → API 保存任务快照并返回 202；Celery 从安全文件继续
   → Parser（TXT / JSONL）
   → Domain.normalize
   → 批量写入 Event
@@ -15,7 +16,7 @@ Upload
 会先把原文写到磁盘。这是红线 5 的实现位置，改动时请保持这个顺序可一眼看出。
 
 本模块刻意**不依赖 FastAPI**：接收 bytes/str，便于直接单测；
-HTTP 层（阶段 10）只负责把 UploadFile 读成 bytes 再调这里。
+HTTP 层使用 prepare 隐私入口，Worker 使用 parse_masked；ingest 保留为离线评测入口。
 """
 
 from __future__ import annotations
@@ -86,7 +87,7 @@ def mask_options_from_datasource(data_source: DataSource) -> dict[str, Any]:
 
     V1 支持的键：
       `mask_ip`        —— 是否脱敏 IP（内网排障常需要，默认 False）
-      `mask_disabled`  —— 明确关闭脱敏（仅供可控场景；默认 False）
+      `mask_disabled`  —— 上传路径拒绝启用此标志，保留作误用检测（默认 False）
       `no_mask_fields` —— 声明不脱敏的字段名，**V1 仅记录不实现**（见下方说明）
     """
     meta = data_source.meta or {}
@@ -203,26 +204,8 @@ class UploadService:
         # ③ 落盘：写的是脱敏后文本，原文永不落盘（红线 5）
         stored_path = self._store_masked(masked_text, filename, project_id)
 
-        # ④ 解析
-        parser = get_parser(fmt)
-        records = parser.parse(masked_text, self.domain)
-
-        # ⑤ 时间戳归一 + ⑥ 批量入库
-        persisted, ts_bad = self._persist(project_id, data_source.id, records, now=now)
-
-        parse_stats = parser.as_dict()
-        parse_stats["encoding"] = encoding
-        parse_stats["mask_ip"] = options["mask_ip"]
-        # 时间戳归一失败的行也要如实计入坏行（红线 4）
-        if ts_bad:
-            parse_stats["bad_lines"] += ts_bad
-            parse_stats["bad_line_samples"] = (
-                parse_stats.get("bad_line_samples", []) + [f"<{ts_bad} 条时间戳无法解析>"]
-            )[:20]
-            denominator = parse_stats["parsed"] + parse_stats["bad_lines"]
-            parse_stats["bad_line_rate"] = (
-                round(parse_stats["bad_lines"] / denominator, 4) if denominator else 0.0
-            )
+        persisted, parse_stats = self.parse_masked(project_id, data_source.id, masked_text,
+            fmt=fmt, encoding=encoding, mask_ip=options["mask_ip"], now=now)
 
         uploads[digest] = {"stored_filename": stored_path.name,
                            "parse": parse_stats, "mask": masker.stats.as_dict()}
@@ -237,6 +220,62 @@ class UploadService:
             mask_stats=masker.stats.as_dict(),
             masked_text=masked_text,
         )
+
+    def parse_masked(self, project_id: int, source_id: int, masked_text: str, *,
+                     fmt: str, encoding: str, mask_ip: bool, now: datetime | None = None) -> tuple[int, dict[str, Any]]:
+        # ④ 解析
+        parser = get_parser(fmt)
+        records = parser.parse(masked_text, self.domain)
+
+        # ⑤ 时间戳归一 + ⑥ 批量入库
+        persisted, ts_bad = self._persist(project_id, source_id, records, now=now)
+
+        parse_stats = parser.as_dict()
+        parse_stats["encoding"] = encoding
+        parse_stats["mask_ip"] = mask_ip
+        # 时间戳归一失败的行也要如实计入坏行（红线 4）
+        if ts_bad:
+            parse_stats["bad_lines"] += ts_bad
+            parse_stats["bad_line_samples"] = (
+                parse_stats.get("bad_line_samples", []) + [f"<{ts_bad} 条时间戳无法解析>"]
+            )[:20]
+            denominator = parse_stats["parsed"] + parse_stats["bad_lines"]
+            parse_stats["bad_line_rate"] = (
+                round(parse_stats["bad_lines"] / denominator, 4) if denominator else 0.0
+            )
+
+        return persisted, parse_stats
+
+    def prepare(self, *, project_id: int, content: bytes, fmt: str,
+                data_source_id: int | None = None, mask_ip: bool = False) -> dict[str, Any]:
+        """隐私接入边界：只校验、内存脱敏、保存安全文件与排队快照，不解析事件。"""
+        from app.repositories.upload_job import UploadJobRepository
+        self._enforce_size_limit(content)
+        lock = int.from_bytes(hashlib.sha256(f"upload-source:{project_id}:{fmt}".encode()).digest()[:8], "big", signed=True)
+        self.session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": lock})
+        source, created = self._resolve_data_source(project_id=project_id, fmt=fmt,
+            filename="已脱敏上传文件", data_source_id=data_source_id)
+        if not mask_options_from_datasource(source)["enabled"]:
+            raise ValueError("上传不允许关闭脱敏")
+        decoded, encoding = self._decode_details(content)
+        masker = Masker(mask_ip=mask_ip)
+        masked = masker.mask(decoded)
+        digest = hashlib.sha256(content + f"\0{fmt}\0{mask_ip}".encode()).hexdigest()
+        path = self._store_masked(masked, "", project_id)
+        try:
+            job = UploadJobRepository(self.session).create(project_id, source.id, {
+                "digest": digest, "stored_filename": path.name, "format": fmt, "encoding": encoding,
+                "mask": masker.stats.as_dict(), "mask_ip": mask_ip, "created_data_source": created,
+                "domain_id": self.domain.domain_id, "domain_version": self.domain.version,
+                "uploads_dir": str(self.uploads_dir.resolve()),
+                "reference_time": datetime.now(timezone.utc).isoformat(),
+                "timezone": self.default_timezone})
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+        if job.get("reused"):
+            path.unlink(missing_ok=True)
+        return job
 
     # ---------- 内部步骤 ----------
 

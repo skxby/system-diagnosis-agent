@@ -37,8 +37,12 @@ def main() -> None:
             from alembic.config import Config
             command.upgrade(Config(str(ROOT / "alembic.ini")), "head")
             flags = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
-            children.append(subprocess.Popen([sys.executable, "-m", "celery", "-A", "app.celery_app",
-                "worker", "-P", "solo", "-l", "warning", "-n", "audit-preview@%h"], cwd=ROOT, **flags))
+            for role, queue in (("analysis", "celery"), ("uploads", "uploads"), ("maintenance", "maintenance")):
+                children.append(subprocess.Popen([sys.executable, "-m", "app.worker_supervisor",
+                    "--role", role, "--queues", queue], cwd=ROOT, **flags))
+            children.append(subprocess.Popen([sys.executable, "-m", "celery", "-A", "app.celery_app", "beat",
+                "--scheduler", "app.beat_scheduler:HealthScheduler", "--max-interval", "5",
+                "--schedule", str(Path(data_dir) / "celerybeat-schedule")], cwd=ROOT, **flags))
             web = subprocess.Popen([sys.executable, "-m", "uvicorn", "app.main:app",
                 "--host", "127.0.0.1", "--port", "8002"], cwd=ROOT, **flags)
             children.append(web)

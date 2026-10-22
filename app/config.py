@@ -5,6 +5,7 @@
 
 from functools import lru_cache
 from pathlib import Path
+import math
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import field_validator
@@ -78,6 +79,20 @@ class Settings(BaseSettings):
     # app/analysis/heartbeat.py 的 DEFAULT_HEARTBEAT_TIMEOUT_SECONDS），
     # 扫描比它勤得多才有意义：否则"回收"最坏要等两倍超时。
     zombie_reap_interval_seconds: int = 60
+    upload_queue: str = "uploads"
+    upload_queue_timeout_seconds: int = 1800
+    worker_task_timeout_seconds: float = 600
+    worker_startup_timeout_seconds: float = 60
+    worker_probe_interval_seconds: float = 30
+    worker_probe_timeout_seconds: float = 20
+
+    @field_validator("worker_task_timeout_seconds", "worker_startup_timeout_seconds",
+                     "worker_probe_interval_seconds", "worker_probe_timeout_seconds", "upload_queue_timeout_seconds")
+    @classmethod
+    def positive_timeout(cls, value: float | int) -> float | int:
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("任务与监督超时必须为正数")
+        return value
 
     # --- 时间 / 日志 ---
     default_timezone: str = "Asia/Shanghai"

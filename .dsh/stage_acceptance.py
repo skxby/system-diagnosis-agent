@@ -87,7 +87,7 @@ ITEMS: list[Item] = [
     Item("03-3", "对样例行能产出标准事件、指标事件", ["tests/unit/test_parser_computer_monitoring.py", "tests/integration/test_upload_pipeline.py"], ["app.domains.computer_monitoring.ComputerMonitoringDomain.parse_line", "app.domains.computer_monitoring.parser.parse_line"], "events_parsed"),
     Item("03-4", "命中异常时能取到对应 runbook", ["tests/unit/test_analyzers_and_loaders.py"], ["app.analysis.pipeline.attach_runbooks", "app.domains.computer_monitoring.ComputerMonitoringDomain.find_runbook_for"], "runbook_attached"),
     # ---------------- 阶段 04 ----------------
-    Item("04-1", "上传 TXT / JSONL 能解析为事件入库，响应含解析统计", ["tests/integration/test_upload_pipeline.py"], ["app.services.upload_service.UploadService.ingest"], "upload_parse"),
+    Item("04-1", "上传 TXT / JSONL 返回任务 ID，后台入库并可查询解析统计", ["tests/integration/test_upload_pipeline.py", "tests/integration/test_async_upload_pg.py"], ["app.services.upload_service.UploadService.prepare", "app.tasks.upload.process_upload"], "upload_parse"),
     Item("04-2", "含邮箱 / 密钥的内容在落盘文件和数据库中都已被替换", ["tests/integration/test_upload_pipeline.py"], ["app.utils.masking.Masker.mask"], "masking_disk_db"),
     Item("04-3", "坏行 / 无法识别的时间戳被计数并明确报告，不静默丢弃", ["tests/integration/test_upload_pipeline.py"], [], "bad_lines"),
     Item("04-4", "未带 data_source_id 的上传能自动建 / 复用 DataSource", ["tests/integration/test_upload_pipeline.py"], ["app.services.upload_service.UploadService._resolve_data_source"], "datasource_reuse"),

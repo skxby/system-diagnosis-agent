@@ -7,6 +7,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
+from tests.upload_client import upload_and_wait
 from fastapi.testclient import TestClient
 from sqlalchemy import select, func
 
@@ -65,7 +66,7 @@ def test_real_worker_saves_l0_report_history_progress_and_reuses_input(context):
     from app.tasks.analysis import _execute
     client, headers, pid, sid, _ = context
     sample = Path(__file__).resolve().parents[1] / "datasets" / "normal" / "system.log"
-    result = client.post(f"/api/projects/{pid}/upload", headers=headers,
+    result = upload_and_wait(client,f"/api/projects/{pid}/upload", headers=headers,
         files={"file": ("13812345678-user@example.com.log", sample.read_bytes())}, data={"fmt": "txt", "data_source_id": sid})
     assert result.status_code == 200, result.text
     assert "13812345678" not in result.json()["stored_filename"]

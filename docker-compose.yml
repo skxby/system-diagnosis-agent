@@ -29,6 +29,7 @@ x-app-image: &app-image
   env_file:
     - .env
   environment:
+    UPLOAD_QUEUE: uploads
     # 容器内用服务名互相寻址；.env 里的 127.0.0.1 是给宿主机直跑用的
     DATABASE_URL: postgresql+psycopg://logagent:${POSTGRES_PASSWORD:-logagent_dev_pw}@postgres:5432/logagent
     REDIS_URL: redis://redis:6379/0
@@ -38,6 +39,8 @@ x-app-image: &app-image
   depends_on:
     migrate:
       condition: service_completed_successfully
+    redis:
+      condition: service_healthy
 
 services:
   # ---------- 基础设施 ----------
@@ -133,20 +136,17 @@ services:
       start_period: 20s
 
   worker:
+    # Supervisor 在子进程中启动 Celery -P solo，并监督整个进程树。
     <<: *app-image
     container_name: logagent-worker
     restart: unless-stopped
-    # Windows 宿主机上直接跑 Celery 必须加 -P solo（AGENTS.md 技术栈）；
-    # 容器内是 Linux，用 solo 同样可用，且与宿主机行为一致、便于对照排障。
-    command:
-      - celery
-      - -A
-      - app.celery_app
-      - worker
-      - -P
-      - solo
-      - -l
-      - info
+    command: [python, -m, app.worker_supervisor, --role, analysis, --queues, celery]
+    healthcheck:
+      test: [CMD, python, -m, app.worker_supervisor, --health, --role, analysis]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -159,24 +159,13 @@ services:
     <<: *app-image
     container_name: logagent-beat
     restart: unless-stopped
-    # 僵尸回收的周期扫描挂在这里（阶段 08 的 last_heartbeat 判据）。
-    #
-    # 为什么是"内嵌 beat 的 worker"而不是纯 beat：
-    # 回收任务必须由一个**独立于分析 worker** 的消费者执行 ——
-    # 分析 worker 挂了正是它要处理的场景，把两者放同一个队列/进程里等于没有回收。
-    # 故：beat 负责按时发任务，同一个容器里的 worker 只消费 `maintenance` 队列。
-    command:
-      - celery
-      - -A
-      - app.celery_app
-      - worker
-      - -P
-      - solo
-      - -l
-      - info
-      - -Q
-      - maintenance
-      - -B
+    command: [celery, -A, app.celery_app, beat, --scheduler, app.beat_scheduler:HealthScheduler, --max-interval, "5", --schedule, /app/data/celerybeat-schedule]
+    healthcheck:
+      test: [CMD, python, -m, app.worker_supervisor, --health, --role, beat]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -184,6 +173,30 @@ services:
         condition: service_healthy
     volumes:
       - appdata:/app/data
+
+  upload-worker:
+    <<: *app-image
+    restart: unless-stopped
+    command: [python, -m, app.worker_supervisor, --role, uploads, --queues, uploads]
+    volumes: [appdata:/app/data]
+    healthcheck:
+      test: [CMD, python, -m, app.worker_supervisor, --health, --role, uploads]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  maintenance-worker:
+    <<: *app-image
+    restart: unless-stopped
+    command: [python, -m, app.worker_supervisor, --role, maintenance, --queues, maintenance]
+    volumes: [appdata:/app/data]
+    healthcheck:
+      test: [CMD, python, -m, app.worker_supervisor, --health, --role, maintenance]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
 volumes:
   pgdata:

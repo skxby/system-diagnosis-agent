@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
+from tests.upload_client import upload_and_wait
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
@@ -65,7 +66,7 @@ def _project(client: TestClient, headers: dict) -> int:
 
 
 def _upload(client: TestClient, headers: dict, project_id: int, content: bytes) -> dict:
-    response = client.post(
+    response = upload_and_wait(client,
         f"/api/projects/{project_id}/upload",
         files={"file": ("syslog.txt", content, "text/plain")},
         data={"fmt": "txt"},
@@ -205,7 +206,7 @@ def test_uploaded_secrets_are_absent_from_disk_and_database(client: TestClient, 
         "Jun 14 15:16:03 combo app[100]: normal line\n"
     ).encode()
 
-    response = client.post(
+    response = upload_and_wait(client,
         f"/api/projects/{project_id}/upload",
         files={"file": ("syslog.txt", content, "text/plain")},
         data={"fmt": "txt"},
@@ -383,7 +384,7 @@ def test_end_to_end_upload_to_evidence(client: TestClient, work_tmp):
         b"Jul  3 13:31:35 host CrashReporterSupportHelper[252]: Internal name did not resolve\n"
         b"Jul  3 13:31:36 host kernel[0]: normal line\n"
     )
-    upload = client.post(
+    upload = upload_and_wait(client,
         f"/api/projects/{project_id}/upload",
         files={"file": ("syslog.txt", content, "text/plain")},
         data={"fmt": "txt"},

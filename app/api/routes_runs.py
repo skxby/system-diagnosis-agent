@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
+from sqlalchemy.orm import Session
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, status
 
@@ -24,7 +25,6 @@ from app.api.schemas import (
     EvidenceResponse,
     InsightResponse,
     RunResponse,
-    UploadResponse,
 )
 from app.api.scoping import InsightScopeDep, RunScopeDep, assert_same_project
 from app.config import get_settings
@@ -52,57 +52,80 @@ def _uploads_dir() -> Path:
 # ============================================================
 
 
-@router.post(
-    "/api/projects/{project_id}/upload",
-    response_model=UploadResponse,
-    tags=["upload"],
-)
-def upload_log(
-    scope: ProjectScopeDep,
-    session: SessionDep,
-    # FastAPI 的文件上传就必须写成 File(...) 默认值，这是框架约定写法
-    file: UploadFile = File(...),  # noqa: B008
-    fmt: str = Form(...),
-    data_source_id: int | None = Form(default=None),
-    mask_ip: bool = Form(default=False),
-) -> UploadResponse:
-    """上传日志：脱敏 → 落盘 → 解析 → 入库（阶段 04 的管道）。
-
-    **原始文件不落盘**，磁盘上只有脱敏后的版本（红线 5）。
-    """
+@router.post("/api/projects/{project_id}/upload", status_code=202, tags=["upload"])
+def upload_log(scope: ProjectScopeDep, session: SessionDep, file: UploadFile = File(...),
+               fmt: str = Form(...), data_source_id: int | None = Form(default=None),
+               mask_ip: bool = Form(default=False)) -> dict:
+    """完成内存脱敏后返回 202；解析和入库只在 Celery 执行。"""
     if fmt not in ("txt", "jsonl"):
-        raise HTTPException(
-            status_code=HTTP_422,
-            detail=f"不支持的格式 {fmt!r}；V1 只支持 txt 与 jsonl",
-        )
-
+        raise HTTPException(HTTP_422, "V1 只支持 txt 与 jsonl")
     from app.services.upload_service import MAX_UPLOAD_BYTES
-    content = file.file.read(MAX_UPLOAD_BYTES + 1)
-
+    from app.repositories.upload_job import public_job
     service = UploadService(session, uploads_dir=_uploads_dir())
     try:
-        result = service.ingest(
-            project_id=scope.project_id,
-            content=content,
-            filename=file.filename or "upload.log",
-            fmt=fmt,
-            data_source_id=data_source_id,
-            mask_ip=mask_ip,
-        )
+        job = service.prepare(project_id=scope.project_id, content=file.file.read(MAX_UPLOAD_BYTES + 1),
+                              fmt=fmt, data_source_id=data_source_id, mask_ip=mask_ip)
     except UploadTooLargeError as exc:
-        # 超限明确拒绝（阶段 04 验收第 5 条），不是悄悄截断
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=str(exc)
-        ) from exc
+        raise HTTPException(413, str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(
-            status_code=HTTP_422, detail=str(exc)
-        ) from exc
+        raise HTTPException(HTTP_422, str(exc)) from exc
+    session.commit()  # 先提交任务快照，Worker 才能从独立会话读取。
+    if not job.get("reused"):
+        job = _enqueue_upload(session, job)
+    return public_job(job)
 
-    # 上传也显式提交：响应"已入库 N 条"之后，紧接着的分析必须能读到它们。
-    # 不提交的话，调用方拿到 200 后立刻发起分析，可能读到空集合。
+
+def _dispatch_upload(job: dict) -> None:
+    from app.tasks.upload import execute_upload
+    from app.utils.observability import current_trace_id
+    execute_upload.apply_async(kwargs={"project_id": job["project_id"], "source_id": job["data_source_id"],
+        "job_id": job["job_id"], "trace_id": current_trace_id()}, queue=get_settings().upload_queue, retry=False)
+
+
+def _enqueue_upload(session: Session, job: dict) -> dict:
+    from app.repositories.upload_job import UploadJobRepository
+    try:
+        _dispatch_upload(job)
+    except Exception:
+        _logger.exception("upload_dispatch_failed", job_id=job["job_id"])
+        job = UploadJobRepository(session).update(job["project_id"], job["data_source_id"], job["job_id"],
+            {"status": "failed", "error": "上传任务派发失败，请恢复队列后重试",
+             "finished_at": datetime.now(timezone.utc).isoformat()}, expected={"queued"})
+        session.commit()
+    return job
+
+
+@router.get("/api/projects/{project_id}/uploads", tags=["upload"])
+def list_uploads(scope: ProjectScopeDep, session: SessionDep) -> list[dict]:
+    from app.repositories.upload_job import UploadJobRepository, public_job
+    return [public_job(job) for job in UploadJobRepository(session).list(scope.project_id)]
+
+
+@router.get("/api/projects/{project_id}/uploads/{job_id}", tags=["upload"])
+def get_upload(job_id: str, scope: ProjectScopeDep, session: SessionDep) -> dict:
+    from app.repositories.upload_job import UploadJobRepository, public_job
+    try:
+        _, job = UploadJobRepository(session).get(scope.project_id, job_id)
+    except KeyError as exc:
+        raise HTTPException(404, "上传任务不存在") from exc
+    return public_job(job)
+
+
+@router.post("/api/projects/{project_id}/uploads/{job_id}/retry", status_code=202, tags=["upload"])
+def retry_upload(job_id: str, scope: ProjectScopeDep, session: SessionDep) -> dict:
+    from app.repositories.upload_job import UploadJobRepository, public_job
+    repo = UploadJobRepository(session)
+    try:
+        source, job = repo.get(scope.project_id, job_id)
+    except KeyError as exc:
+        raise HTTPException(404, "上传任务不存在") from exc
+    if job["status"] != "failed":
+        raise HTTPException(409, "只有失败的上传任务可以重试")
+    fields = {key: job[key] for key in ("digest", "stored_filename", "format", "encoding", "mask",
+              "mask_ip", "created_data_source", "domain_id", "domain_version", "timezone", "uploads_dir", "reference_time")}
+    new = repo.create(scope.project_id, source.id, fields)
     session.commit()
-    return UploadResponse(**result.as_dict())
+    return public_job(_enqueue_upload(session, new) if not new.get("reused") else new)
 
 
 # ============================================================
@@ -133,6 +156,9 @@ def create_analysis_run(
             detail=f"数据源 {payload.data_source_id} 不存在",
         )
 
+    if any(job.get("status") in {"queued", "running"} for job in
+           (source.meta or {}).get("upload_jobs", {}).values()):
+        raise HTTPException(409, "该来源仍有上传解析任务，请等待完成后发起分析")
     domain = _load_domain()
     start = (
         payload.time_range.start

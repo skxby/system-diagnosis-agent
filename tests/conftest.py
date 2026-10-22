@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,9 @@ def pytest_configure(config):
         admin.dispose()
         raise pytest.UsageError(f"测试 PostgreSQL 不可用：{type(exc).__name__}；先启动 postgres/redis") from exc
     config._audit_test_database = (admin, database)
+    config._audit_data_dir = tempfile.TemporaryDirectory(prefix="logagent-tests-")
+    os.environ["DATA_DIR"] = config._audit_data_dir.name
+    os.environ["UPLOAD_QUEUE"] = "test-uploads-" + secrets.token_hex(8)
     os.environ["DATABASE_URL"] = original_url.set(database=database).render_as_string(hide_password=False)
     get_settings.cache_clear()
     from alembic.config import Config
@@ -54,3 +58,32 @@ def pytest_sessionfinish(session, exitstatus):
         with admin.connect() as connection:
             connection.execute(text(f'DROP DATABASE "{database}" WITH (FORCE)'))
         admin.dispose()
+        session.config._audit_data_dir.cleanup()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def real_upload_worker(request):
+    if not hasattr(request.config, "_audit_test_database"):
+        yield
+        return
+    import subprocess
+    import sys
+    import time
+    from app.config import get_settings
+    from app.worker_supervisor import healthy, terminate_tree
+    settings = get_settings()
+    log_path = Path(settings.data_dir) / "upload-worker.log"
+    flags = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+    with log_path.open("w", encoding="utf-8") as output:
+        process = subprocess.Popen([sys.executable, "-m", "app.worker_supervisor", "--role", "uploads",
+            "--queues", settings.upload_queue], stdout=output, stderr=subprocess.STDOUT, **flags)
+        try:
+            deadline = time.monotonic() + 40
+            while not healthy("uploads"):
+                if process.poll() is not None or time.monotonic() > deadline:
+                    pytest.fail("真实上传 Worker 未就绪：" + log_path.read_text(encoding="utf-8")[-2500:])
+                time.sleep(.2)
+            yield
+        finally:
+            terminate_tree(process.pid)
+            process.wait(timeout=10)

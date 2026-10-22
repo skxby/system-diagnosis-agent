@@ -93,7 +93,14 @@ async function main() {
   const logBytes = fs.readFileSync("tests/datasets/crash/system.log");
   const form = multipart({ file: { file: logBytes, filename: "crash.log" }, fmt: "txt" });
   r = await request("POST", `/api/projects/${projectId}/upload`, { raw: form.body, contentType: form.contentType });
-  check("上传 200 且事件入库", r.status === 200 && r.body.events_persisted > 0,
+  check("上传返回 202", r.status === 202, `HTTP ${r.status}`);
+  const uploadJobId = r.body.job_id;
+  for (let attempt = 0; attempt < 300; attempt++) {
+    r = await request("GET", `/api/projects/${projectId}/uploads/${uploadJobId}`);
+    if (['completed', 'failed'].includes(r.body.status)) break;
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+  check("异步上传解析完成且事件入库", r.status === 200 && r.body.status === "completed" && r.body.events_persisted > 0,
         `persisted=${r.body.events_persisted} parsed=${r.body.parse?.parsed} bad=${r.body.parse?.bad_lines}`);
   const sourceId = r.body.data_source_id;
 
